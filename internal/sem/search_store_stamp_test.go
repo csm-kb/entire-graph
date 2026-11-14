@@ -2,6 +2,7 @@ package sem
 
 import (
 	"bytes"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -80,4 +81,44 @@ func focusFixtureEntryPath(t *testing.T, fixture focusFixture) string {
 		t.Fatalf("want one complete entry, got %q", entries)
 	}
 	return entries[0]
+}
+
+// An entry replaced by another file of the same size, with its modification
+// time put back, is a different entry: the lookup must hash it rather than
+// trust the stamp. Break caught: trusting size and modification time alone,
+// which serves the replaced entry's store as if it were current.
+//
+// The setup replaces the cache file directly instead of rewriting the entry
+// through Graph, which would also rebuild its store; a rename is the cheap
+// way to get a new file with the old size and time.
+func TestFocusedLookupHashesAReplacedEntryWithTheSameSizeAndTime(t *testing.T) {
+	fixture := indexFocusFixture(t)
+	path := focusFixtureEntryPath(t, fixture)
+	original, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(filepath.Dir(path), "replacement.tmp")
+	if err := os.WriteFile(replacement, bytes.Repeat([]byte{'x'}, int(original.Size())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, original.ModTime(), original.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	// Checked first: the focused miss below falls back to the full load,
+	// which may write a fresh store.
+	if _, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options); !errors.Is(err, ErrSearchStoreMissing) {
+		t.Fatalf("premise: the replaced entry's store must not describe as current, got %v", err)
+	}
+	_, focused, _, err := LoadFocusedProviderSnapshot(t.Context(), fixture.repo, fixture.version,
+		fixture.options, fixture.cacheDir, false, leafCallsFocus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if focused {
+		t.Fatal("a replaced entry with the same size and modification time was trusted, and its old store answered")
+	}
 }

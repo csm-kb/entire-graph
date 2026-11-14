@@ -945,32 +945,31 @@ func memoizedEntryDigest(ctx context.Context, entry cacheEntry) (cacheDigest, er
 	return digest, nil
 }
 
-// searchStoreEntryStamp is the gz entry's size and modification time as they
-// were when its sidecar was written, recorded beside the digest (meta key
-// entry_stamp). A lookup that finds the entry with the same stamp takes the
-// recorded digest instead of hashing the entry (openExactSearchStoreForEntry,
-// trustStamp): on the Linux kernel the entry is 400 MB and its hash a fifth of
-// a focused lookup.
+// searchStoreEntryStamp is the gz entry's size, modification time and file
+// identity as they were when its store was written, recorded beside the
+// digest (meta key entry_stamp). A lookup that finds the entry with the same
+// stamp takes the recorded digest instead of hashing the entry
+// (openExactSearchStoreForEntry, trustStamp): on the Linux kernel the entry is
+// 400 MB and its hash a fifth of a focused lookup.
 //
 // This is an integrity cache, not a security boundary. The digest check it
-// stands in for catches an entry and a sidecar left by different writes, not
-// tampering: whoever can rewrite the entry can rewrite the sidecar beside it.
-// Every writer replaces the entry by renaming a freshly written file over it,
-// which gives it a new modification time; the bytes written under one key are
-// deterministic; and `index --force` rewrites the entry and the sidecar
-// together. An entry whose size and time to the nanosecond are still the
-// recorded ones is therefore the entry the sidecar was written from, and any
-// difference brings the hash back. A sidecar written without a stamp (an
-// older one, or one whose entry changed while it was stamped) is always
-// checked by hash.
-//
-// "A new modification time" assumes the filesystem's timestamps are finer
-// than the gap between two writes of one entry. On a coarse one (FAT's 2 s,
-// HFS+'s or ext3's 1 s), two same-size writes within one tick keep the stamp,
-// and only the determinism of same-key bytes keeps the recorded digest right.
+// stands in for catches an entry and a store left by different writes, not
+// tampering: whoever can rewrite the entry can rewrite the store beside it.
+// Every writer replaces the entry by renaming a freshly created file over it
+// (cacheEntry.writeValue), so each write gives the entry a new file identity:
+// a new file index on Windows, a new inode on POSIX, since the new file exists
+// before the old one is unlinked. An entry whose identity, size and
+// modification time are still the recorded ones is therefore the entry the
+// store was written from, and any difference brings the hash back. The bytes
+// written under one key are not deterministic (the entry embeds the commit
+// and the repository root, which the key leaves out), which is why the
+// identity is needed: size and a coarse modification time alone can survive a
+// rewrite. A store written without a stamp, or with one that has no file
+// identity, is always checked by hash.
 type searchStoreEntryStamp struct {
-	Size      int64 `json:"size"`
-	ModTimeNS int64 `json:"mtime_ns"`
+	Size      int64  `json:"size"`
+	ModTimeNS int64  `json:"mtime_ns"`
+	FileID    string `json:"file_id"`
 }
 
 func searchEntryStampOf(file *os.File) (searchStoreEntryStamp, error) {
@@ -978,7 +977,11 @@ func searchEntryStampOf(file *os.File) (searchStoreEntryStamp, error) {
 	if err != nil {
 		return searchStoreEntryStamp{}, err
 	}
-	return searchStoreEntryStamp{Size: info.Size(), ModTimeNS: info.ModTime().UnixNano()}, nil
+	id, err := openedFileID(file, info)
+	if err != nil {
+		return searchStoreEntryStamp{}, err
+	}
+	return searchStoreEntryStamp{Size: info.Size(), ModTimeNS: info.ModTime().UnixNano(), FileID: id}, nil
 }
 
 // stampSearchEntry returns the entry's stamp for a sidecar that records
