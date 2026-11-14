@@ -649,10 +649,25 @@ func TestSearchStoreRepublishLeavesOneStoreAtKeepZero(t *testing.T) {
 	fixture := indexFocusFixture(t)
 	forced := fixture.options
 	forced.ForceRebuild = true
-	for range 3 {
+	describe := func() string {
+		t.Helper()
+		descriptor, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return descriptor.Path
+	}
+	if _, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	before := describe()
+	for range 2 {
 		if _, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if describe() == before {
+		t.Fatal("premise: a forced rebuild must publish a new store")
 	}
 	if got := searchStoreFilesForTest(t, fixture.cacheDir); len(got) != 1 {
 		t.Fatalf("want the current store only, got %v", got)

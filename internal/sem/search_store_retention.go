@@ -194,12 +194,18 @@ func newSearchStoreRetention(ctx context.Context, store cacheEntry, cache *cache
 // removal that fails (Windows: a reader holds the file) is skipped; the next
 // publish retries it.
 func sweepSupersededSearchStores(ctx context.Context, directory *os.Root, directoryPath, publishedKeyDir, publishedName string, remove func(*os.Root, string) error) {
+	if ctx.Err() != nil {
+		return
+	}
 	names, err := listCacheDirectoryNames(directory)
 	if err != nil {
 		return
 	}
 	now := time.Now()
 	for _, name := range names {
+		if ctx.Err() != nil {
+			return
+		}
 		if searchStoreKeyDirName(name) {
 			sweepSearchStoreKeyDir(ctx, directory, directoryPath, name, publishedKeyDir, publishedName, remove, now)
 		}

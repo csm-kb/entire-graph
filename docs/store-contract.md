@@ -15,9 +15,10 @@ missing or stale rebuilds it from the entry. Whenever a store write fails (a
 full disk, for example), on that rebuild or on a cold build by `index`, a
 `--head` lookup or `query`, the command still succeeds and its `warnings` carry
 `W_SEARCH_STORE_UNAVAILABLE` with the reason (`explain`'s `warnings` is present
-only when it carries one); lookups then use the previous store if it still matches the entry, otherwise
-the full snapshot load. After a search-store version bump, an existing store is
-treated as missing: lookups fall back to the full snapshot load (correct, slower) until
+only when it carries one); lookups then use the previous store if it still
+matches the entry, otherwise the full snapshot load. After a search-store
+version bump, an existing store is treated as missing: lookups fall back to the
+full snapshot load (correct, slower) until
 `graph index --head` or the next cache-miss write rebuilds the store.
 
 The JSON descriptor carries `contract_version: 1`, an absolute `path`,
@@ -64,10 +65,11 @@ before the Brain consumer that retires its duplicate code graph.
 
 ## Store key
 
-A store is a sidecar of one search snapshot entry and shares its key. It lives in `<key>.sqlite.d/` beside the entry, under a
-generated name; consumers take `path` from the descriptor and never construct
-it. The key is
-`searchSnapshotKeyForSchema` (`internal/sem/search_cache.go`) and hashes exactly:
+A store is a sidecar of one search snapshot entry and shares its key. It lives
+in `<key>.sqlite.d/` beside the entry, under a generated name; consumers take
+`path` from the descriptor and never construct it. The key is
+`searchSnapshotKeyForSchema` (`internal/sem/search_cache.go`) and hashes
+exactly:
 
 - the search cache version and the provider schema version;
 - the repository key class (`gh/<owner>/<name>`, or one term for every `local/` key)

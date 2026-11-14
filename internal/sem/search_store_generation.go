@@ -142,6 +142,10 @@ func readSearchStoreRecordedStamp(ctx context.Context, path string) *searchStore
 		return nil
 	}
 	defer db.Close()
+	var version string
+	if err := readSearchStoreMetaKey(ctx, db, "store_version", &version); err != nil || version != searchStoreVersion {
+		return nil
+	}
 	var stamp searchStoreEntryStamp
 	if err := readSearchStoreMetaKey(ctx, db, "entry_stamp", &stamp); err != nil {
 		return nil

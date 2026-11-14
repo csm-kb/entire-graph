@@ -12,11 +12,11 @@ import (
 	"time"
 )
 
-// A focused lookup takes the gz entry's size and modification time, recorded
-// in the sidecar beside the digest, as proof the entry is the one the sidecar
-// mirrors. Any change to either brings the hash back, and the hash catches a
-// changed entry. Break caught: an entry rewritten after its sidecar was built
-// is answered from the sidecar as though it were unchanged.
+// A focused lookup takes the gz entry's stamp (size, modification time and
+// file identity), recorded in the store beside the digest, as proof the entry
+// is the one the store mirrors. Any change to the stamp brings the hash back,
+// and the hash catches a changed entry. Break caught: an entry rewritten after
+// its store was built is answered from the store as though it were unchanged.
 func TestFocusedLookupHashesAnEntryWhoseStampChanged(t *testing.T) {
 	fixture := indexFocusFixture(t)
 	rewriteEntryChangingItsStamp(t, focusFixtureEntryPath(t, fixture))

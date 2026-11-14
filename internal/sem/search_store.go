@@ -999,9 +999,11 @@ func searchEntryStampOf(file *os.File) (searchStoreEntryStamp, error) {
 
 // stampSearchEntry hashes the entry once and returns its stamp, for a store
 // that records entryDigest. changed reports an entry that is not the one
-// entryDigest was taken from: its bytes hash to another digest, or its stamp
-// moved during the read because another writer replaced it. That writer
-// publishes the store for its own bytes, so this one quietly builds nothing.
+// entryDigest was taken from: its bytes hash to another digest, or the open
+// file was modified in place during the read. An entry replaced by another
+// writer is caught by that digest mismatch or by the re-stat after the build.
+// That writer publishes the store for its own bytes, so this one quietly
+// builds nothing.
 // err reports an entry that cannot be read.
 func stampSearchEntry(entry cacheEntry, entryDigest string) (stamp searchStoreEntryStamp, changed bool, err error) {
 	file, err := entry.open()

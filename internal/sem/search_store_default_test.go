@@ -107,4 +107,12 @@ func TestFailedStorePublishKeepsThePreviousStore(t *testing.T) {
 	if _, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options); err != nil {
 		t.Fatalf("the previous store must still resolve: %v", err)
 	}
+	if err := filepath.WalkDir(fixture.cacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(path, ".tmp") {
+			t.Errorf("the failed publish left a temporary file: %s", path)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
