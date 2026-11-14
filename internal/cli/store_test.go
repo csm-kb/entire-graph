@@ -225,8 +225,8 @@ func TestColdIndexSurfacesStoreWriteFailureAsWarning(t *testing.T) {
 		return runWithStdin(t, "", verb, args...)
 	}
 	// coldCacheWithBlockedSidecar returns a cache directory with no complete
-	// entry for the fixture's tree and a non-empty directory where that
-	// entry's sidecar will be written. An index run without the store first
+	// entry for the fixture's tree and a regular file where that entry's store
+	// directory belongs. An index run without the store first
 	// names the entry, then the entry is removed so the next build is cold.
 	coldCacheWithBlockedSidecar := func(t *testing.T) string {
 		t.Helper()
@@ -249,8 +249,8 @@ func TestColdIndexSurfacesStoreWriteFailureAsWarning(t *testing.T) {
 		if err := os.Remove(entries[0]); err != nil {
 			t.Fatal(err)
 		}
-		sidecar := strings.TrimSuffix(entries[0], ".json.gz") + ".sqlite"
-		if err := os.MkdirAll(filepath.Join(sidecar, "blocker"), 0o700); err != nil {
+		keyDir := strings.TrimSuffix(entries[0], ".json.gz") + ".sqlite.d"
+		if err := os.WriteFile(keyDir, []byte("blocker"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return cache

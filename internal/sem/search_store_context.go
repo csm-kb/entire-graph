@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -620,32 +622,50 @@ func openExactSearchStore(ctx context.Context, cacheDir, key, tree string) (exac
 }
 
 // openExactSearchStoreForEntry is openExactSearchStore's check for an entry
-// already resolved, reading only the sidecar's meta. entryDigest supplies the
-// gz entry's digest and is called only once a sidecar exists; the prebuild's
+// already resolved, reading only the store's meta. entryDigest supplies the
+// gz entry's digest and is called only once a store exists; the prebuild's
 // repair passes one that reuses the digest its cache hit already hashed.
 //
-// trustStamp lets an entry whose size and modification time are the ones the
-// sidecar recorded stand for the recorded digest without being hashed (see
-// searchStoreEntryStamp). Only the lookup verbs' focused load passes it; the
-// store descriptor, `graph context` and the prebuild hash the entry.
+// trustStamp lets an entry whose stamp is the one the store recorded stand
+// for the recorded digest without being hashed (see searchStoreEntryStamp).
+// Only the lookup verbs' focused load passes it; the store descriptor,
+// `graph context` and the prebuild hash the entry.
+//
+// The store is the key's current generation (resolveSearchStoreGeneration).
+// A generation removed by a sweep between resolution and open is a resolution
+// race, not a fault: it is resolved once more, and then reported as a miss.
+// modernc's open failure does not wrap fs.ErrNotExist, so the race is
+// recognised by an Lstat after the failure.
 func openExactSearchStoreForEntry(ctx context.Context, entry cacheEntry, tree string, entryDigest func(cacheEntry) (cacheDigest, error), trustStamp bool) (exactSearchStore, *sql.DB, error) {
-	store := searchStoreEntryFor(entry)
-	path := filepath.Join(store.root, store.relative)
-	if !searchStoreFileIsRegular(path) {
-		return exactSearchStore{}, nil, ErrSearchStoreMissing
+	for attempt := 0; attempt < 2; attempt++ {
+		store, db, err := openResolvedSearchStore(ctx, entry, tree, entryDigest, trustStamp)
+		if !errors.Is(err, errSearchStoreGenerationGone) {
+			return store, db, err
+		}
 	}
-	// Without trustStamp the entry is hashed before the sidecar is opened, as
-	// it always was, so an unreadable entry is a quiet miss whatever state the
-	// sidecar is in. With it, the hash waits for the sidecar's recorded stamp.
+	return exactSearchStore{}, nil, ErrSearchStoreMissing
+}
+
+// errSearchStoreGenerationGone marks a resolved generation that no longer
+// exists when opened. openExactSearchStoreForEntry never returns it.
+var errSearchStoreGenerationGone = errors.New("search store generation removed after it was resolved")
+
+func openResolvedSearchStore(ctx context.Context, entry cacheEntry, tree string, entryDigest func(cacheEntry) (cacheDigest, error), trustStamp bool) (exactSearchStore, *sql.DB, error) {
+	generation, entryStamp, err := resolveSearchStoreGeneration(ctx, entry)
+	if err != nil {
+		return exactSearchStore{}, nil, err
+	}
+	// Without trustStamp the entry is hashed before the store is opened, as it
+	// always was, so an unreadable entry is a quiet miss whatever state the
+	// store is in. With it, the hash waits for the store's recorded stamp.
 	var digest cacheDigest
-	var err error
 	if !trustStamp {
 		if digest, err = entryDigest(entry); err != nil {
 			return exactSearchStore{}, nil, ErrSearchStoreMissing
 		}
 	}
 
-	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(path)+"?immutable=1&mode=ro")
+	db, err := openSearchStoreForRead(generation.path)
 	if err != nil {
 		return exactSearchStore{}, nil, err
 	}
@@ -655,6 +675,9 @@ func openExactSearchStoreForEntry(ctx context.Context, entry cacheEntry, tree st
 	}
 	var version, storedDigest string
 	if err := readSearchStoreMetaKey(ctx, db, "store_version", &version); err != nil {
+		if _, statErr := os.Lstat(generation.path); errors.Is(statErr, fs.ErrNotExist) {
+			return fail(errSearchStoreGenerationGone)
+		}
 		return fail(err)
 	}
 	if err := readSearchStoreMetaKey(ctx, db, "entry_digest", &storedDigest); err != nil {
@@ -664,7 +687,7 @@ func openExactSearchStoreForEntry(ctx context.Context, entry cacheEntry, tree st
 		return fail(ErrSearchStoreMissing)
 	}
 	// A matching stamp stands for the recorded digest (searchStoreEntryStamp).
-	stamped := trustStamp && searchEntryStampMatches(ctx, db, entry)
+	stamped := trustStamp && generation.stamp != nil && *generation.stamp == entryStamp
 	if trustStamp && !stamped {
 		if digest, err = entryDigest(entry); err != nil {
 			return fail(ErrSearchStoreMissing)
@@ -680,7 +703,7 @@ func openExactSearchStoreForEntry(ctx context.Context, entry cacheEntry, tree st
 	if meta.Tree != tree {
 		return fail(searchStoreTreeMismatch(tree, meta.Tree))
 	}
-	return exactSearchStore{path: path, entryDigest: storedDigest, meta: meta}, db, nil
+	return exactSearchStore{path: generation.path, entryDigest: storedDigest, meta: meta}, db, nil
 }
 
 // errSearchStoreNotExact marks a store whose recorded tree differs from the

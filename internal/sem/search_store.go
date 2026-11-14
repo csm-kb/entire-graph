@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -728,29 +729,20 @@ func decodeSearchStoreParallel(count int, decode func(int) error) error {
 	return errors.Join(errs...)
 }
 
-// searchStoreEntryFor is the ONE place the sidecar's name is derived from its
-// entry: the entry's relative path with .sqlite replacing .json.gz. Writer and
-// reader both address the artifact through this, so the two spellings cannot
-// drift into a silent permanent miss.
-func searchStoreEntryFor(entry cacheEntry) cacheEntry {
-	store := entry
-	store.relative = strings.TrimSuffix(entry.relative, ".json.gz") + ".sqlite"
-	return store
-}
-
-// writeSearchStoreSidecar builds the sqlite sidecar for an entry that was just
+// writeSearchStoreSidecar builds the sqlite store for an entry that was just
 // written with entryDigest. It goes through the same confined directory walk
-// every cache write uses, builds into a temporary, and renames into place. On
-// ANY failure it removes both the temporary and any previous sidecar: the
-// invariant readers rely on is that a sidecar present on disk was written by
-// the same call that wrote the current entry (the digest check backstops the
-// crash window between the two renames). A successful publish then trims the
-// sidecars of the same repository and scope to the newest few
-// (search_store_retention.go); the gz entries are never trimmed.
+// every cache write uses, opens the key's directory (searchStoreKeyDirFor)
+// the same way, builds into a temporary there, and renames it to a fresh
+// generation name. The publish step never renames over or modifies a store,
+// so no reader holding one can make it fail. A failure removes only the
+// temporary: the previous generation keeps serving while its digest still
+// matches the entry. A successful publish then trims the stores of the same
+// repository and scope to the newest few (search_store_retention.go); the gz
+// entries are never trimmed.
 func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest string, cache *cachedSearchSnapshot) error {
 	if !searchStoreEnabled() {
 		// The write is gated by the same flag as the read: with no reader, a
-		// sidecar taxes every complete persist with the build plus ~144MB per
+		// store taxes every complete persist with the build plus ~144MB per
 		// cache variant. Re-enabling costs one rebuild (`graph index`, or the
 		// next cold build) instead.
 		return nil
@@ -760,56 +752,54 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 		return err
 	}
 	defer directory.Close()
-	store := searchStoreEntryFor(entry)
-	succeeded := false
-	defer func() {
-		if !succeeded {
-			// A failed build must not leave a previous sidecar behind either:
-			// it would mirror an entry that no longer exists.
-			_ = directory.Remove(filepath.Base(store.relative))
-		}
-	}()
-	temporary, temporaryName, err := createRootTemp(directory, "store")
+	keyDirEntry := searchStoreKeyDirFor(entry)
+	keyDirName := filepath.Base(keyDirEntry.relative)
+	keyDir, err := openCacheComponent(directory, keyDirName, (*os.Root).OpenRoot)
+	if err != nil {
+		return err
+	}
+	defer keyDir.Close()
+	directoryPath := filepath.Join(entry.root, filepath.Dir(entry.relative))
+	keyDirPath := filepath.Join(directoryPath, keyDirName)
+	temporary, temporaryName, err := createSearchStoreTemp(keyDir)
 	if err != nil {
 		return err
 	}
 	removeTemporary := true
 	defer func() {
 		if removeTemporary {
-			_ = directory.Remove(temporaryName)
+			_ = keyDir.Remove(temporaryName)
 		}
 	}()
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	directoryPath := filepath.Join(entry.root, filepath.Dir(entry.relative))
-	temporaryPath := filepath.Join(directoryPath, temporaryName)
-	if err := buildSearchStore(ctx, temporaryPath, entryDigest, stampSearchEntry(entry, entryDigest), cache); err != nil {
+	if err := buildSearchStore(ctx, filepath.Join(keyDirPath, temporaryName), entryDigest, stampSearchEntry(entry, entryDigest), cache); err != nil {
 		return err
 	}
 	if beforeSearchStorePublish != nil {
-		beforeSearchStorePublish()
+		if err := beforeSearchStorePublish(); err != nil {
+			return err
+		}
 	}
-	// Publish and trim under one hold of the retention lock, so no eviction
-	// pass in another process can list, then remove, a name this rename has
-	// just replaced. Without the lock the store is still published; only the
-	// eviction is skipped (see search_store_retention.go).
-	retention, retain := newSearchStoreRetention(ctx, store, cache)
+	// Publish and trim under one hold of the retention lock. Without the lock
+	// the store is still published; only the eviction is skipped (see
+	// search_store_retention.go).
+	retention, retain := newSearchStoreRetention(ctx, keyDirEntry, cache)
 	var lock *completeBuildLock
 	if retain {
 		lock = acquireSearchStoreRetentionLock(ctx, directory)
 	}
 	defer lock.release()
-	if err := directory.Rename(temporaryName, filepath.Base(store.relative)); err != nil {
+	if err := keyDir.Rename(temporaryName, newSearchStoreGenerationName()); err != nil {
 		return err
 	}
 	removeTemporary = false
-	succeeded = true
 	if afterSearchStorePublish != nil {
 		afterSearchStorePublish()
 	}
 	if lock != nil {
-		// Best effort, like the sidecar itself: the publish has succeeded, and a
+		// Best effort, like the store itself: the publish has succeeded, and a
 		// store that could not be trimmed now is trimmed by a later publish.
 		_, _ = evictSearchStoreSidecars(ctx, directory, directoryPath, retention)
 	}
@@ -1012,42 +1002,31 @@ func stampSearchEntry(entry cacheEntry, entryDigest string) *searchStoreEntrySta
 	return &before
 }
 
-// searchEntryStampMatches reports whether the sidecar on db recorded a stamp
-// and the entry on disk still has it.
-func searchEntryStampMatches(ctx context.Context, db *sql.DB, entry cacheEntry) bool {
-	var recorded searchStoreEntryStamp
-	if err := readSearchStoreMetaKey(ctx, db, "entry_stamp", &recorded); err != nil {
-		return false
-	}
-	file, err := entry.open()
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-	current, err := searchEntryStampOf(file)
-	return err == nil && current == recorded
-}
-
-// loadSearchStoreForEntry serves the entry's snapshot from the sqlite sidecar
-// when the store is enabled and the sidecar matches the entry on disk. The
+// loadSearchStoreForEntry serves the entry's snapshot from its current store
+// when the store is enabled and that store matches the entry on disk. The
 // bool reports whether the store answered; every failure is a quiet miss so
-// the gz entry stays authoritative.
+// the gz entry stays authoritative. A generation removed between resolution
+// and load is resolved once more, as in openExactSearchStoreForEntry.
 func loadSearchStoreForEntry(ctx context.Context, entry cacheEntry) (cachedSearchSnapshot, bool) {
 	if !searchStoreEnabled() {
 		return cachedSearchSnapshot{}, false
 	}
-	store := searchStoreEntryFor(entry)
-	path := filepath.Join(store.root, store.relative)
-	if _, err := os.Stat(path); err != nil {
-		return cachedSearchSnapshot{}, false
+	for attempt := 0; attempt < 2; attempt++ {
+		generation, _, err := resolveSearchStoreGeneration(ctx, entry)
+		if err != nil {
+			return cachedSearchSnapshot{}, false
+		}
+		digest, err := memoizedEntryDigest(ctx, entry)
+		if err != nil {
+			return cachedSearchSnapshot{}, false
+		}
+		cache, err := loadSearchStore(ctx, generation.path, digest.String())
+		if err == nil {
+			return cache, true
+		}
+		if _, statErr := os.Lstat(generation.path); !errors.Is(statErr, fs.ErrNotExist) {
+			return cachedSearchSnapshot{}, false
+		}
 	}
-	digest, err := memoizedEntryDigest(ctx, entry)
-	if err != nil {
-		return cachedSearchSnapshot{}, false
-	}
-	cache, err := loadSearchStore(ctx, path, digest.String())
-	if err != nil {
-		return cachedSearchSnapshot{}, false
-	}
-	return cache, true
+	return cachedSearchSnapshot{}, false
 }

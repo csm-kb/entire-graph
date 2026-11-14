@@ -78,14 +78,15 @@ const (
 var searchStoreRetentionLockWait = 5 * time.Second
 
 // Test seams. beforeSearchStorePublish runs after the store is built and
-// before the publish takes the retention lock; afterSearchStorePublish runs
-// right after the rename; beforeSearchStoreEvictionRemove runs after an
-// eviction pass has chosen what to remove and before it removes anything.
-// They let a test force the interleaving of a writer and an evictor.
-// removeSearchStoreSidecar is the removal a publish's eviction pass uses, so
-// a test can stand in for a platform that refuses to delete an open file.
+// before it is renamed into place; an error it returns fails the publish, as
+// a failed rename would. afterSearchStorePublish runs right after the rename;
+// beforeSearchStoreEvictionRemove runs after an eviction pass has chosen what
+// to remove and before it removes anything. They let a test force the
+// interleaving of a writer and an evictor, or a failed publish.
+// removeSearchStoreSidecar is the removal every pass uses, so a test can
+// stand in for a platform that refuses to delete an open file.
 var (
-	beforeSearchStorePublish        func()
+	beforeSearchStorePublish        func() error
 	afterSearchStorePublish         func()
 	beforeSearchStoreEvictionRemove func()
 	removeSearchStoreSidecar        = (*os.Root).Remove
@@ -115,7 +116,8 @@ type searchStoreRetention struct {
 	// group is searchStoreRetentionGroup of the store being published. Only
 	// stores in this group are considered.
 	group string
-	// protectNames are store file names never evicted (the one published).
+	// protectNames are candidate names never evicted: the key directory of the
+	// store being published.
 	protectNames map[string]bool
 	// protectTree, when set, is the publishing checkout's current HEAD tree.
 	protectTree string
@@ -136,15 +138,20 @@ type searchStoreCandidate struct {
 	size    int64
 	modTime time.Time
 	tree    string
+	// generations are the generation names a key directory candidate listed,
+	// the only names its eviction removes; nil for a legacy <key>.sqlite file.
+	generations []string
 }
 
 func searchStoreRetentionGroup(repositoryKey, repoScope string) string {
 	return repositoryKey + "\x00" + repoScope
 }
 
-// searchStoreSidecarName reports whether name is a published store: a cache
-// key followed by .sqlite. Temporaries (".store-*.json.gz"), gz entries, lock
-// files and derived-entry directories never match.
+// searchStoreSidecarName reports whether name is a legacy store, a cache key
+// followed by .sqlite, published before stores moved into key directories.
+// Such a file is aged out by the window and never read. Temporaries
+// (".store-*.json.gz"), gz entries, lock files and derived-entry directories
+// never match.
 func searchStoreSidecarName(name string) bool {
 	key, ok := strings.CutSuffix(name, ".sqlite")
 	return ok && validSHA256Hex(key)
@@ -211,7 +218,10 @@ func acquireSearchStoreRetentionLock(ctx context.Context, directory *os.Root) *c
 // outside it. The caller must hold the retention lock. directoryPath is the
 // filesystem path of directory, which sqlite needs to read each store's
 // identity. A store whose identity cannot be read is never removed: retention
-// only deletes what it can attribute to the group being trimmed.
+// only deletes what it can attribute to the group being trimmed. Evicting a
+// key removes only the generations this pass listed; the key directory stays.
+// The result records generation names, legacy file names, and the name of a
+// key directory that could not be opened.
 func evictSearchStoreSidecars(ctx context.Context, directory *os.Root, directoryPath string, retention searchStoreRetention) (searchStoreEviction, error) {
 	candidates, err := listSearchStoreGroup(ctx, directory, directoryPath, retention.group)
 	if err != nil {
@@ -225,54 +235,115 @@ func evictSearchStoreSidecars(ctx context.Context, directory *os.Root, directory
 	if beforeSearchStoreEvictionRemove != nil {
 		beforeSearchStoreEvictionRemove()
 	}
+	listed := make(map[string]searchStoreCandidate, len(candidates))
+	for _, candidate := range candidates {
+		listed[candidate.name] = candidate
+	}
 	for _, name := range evict {
-		err := retention.remove(directory, name)
-		switch {
-		case err == nil:
-			result.Evicted = append(result.Evicted, name)
-		case errors.Is(err, fs.ErrNotExist):
-			// Already gone: removed by hand, or by a failed rebuild's cleanup.
-		default:
-			// Windows refuses to delete a file another process holds open, as
-			// a reader of this store does. Leave it; a later publish retries.
-			if result.Skipped == nil {
-				result.Skipped = make(map[string]error)
-			}
-			result.Skipped[name] = err
+		candidate := listed[name]
+		if candidate.generations == nil {
+			result.record(name, retention.remove(directory, name))
+			continue
 		}
+		keyDir, err := openCacheComponent(directory, name, (*os.Root).OpenRoot)
+		if err != nil {
+			result.record(name, err)
+			continue
+		}
+		for _, generation := range candidate.generations {
+			result.record(generation, retention.remove(keyDir, generation))
+		}
+		_ = keyDir.Close()
 	}
 	return result, nil
 }
 
-// listSearchStoreGroup returns the published stores in directory that belong
-// to group.
-func listSearchStoreGroup(ctx context.Context, directory *os.Root, directoryPath, group string) ([]searchStoreCandidate, error) {
+// record files one removal's outcome under name.
+func (result *searchStoreEviction) record(name string, err error) {
+	switch {
+	case err == nil:
+		result.Evicted = append(result.Evicted, name)
+	case errors.Is(err, fs.ErrNotExist):
+		// Already gone: removed by hand, or by another pass.
+	default:
+		// Windows refuses to delete a file another process holds open, as
+		// a reader of this store does. Leave it; a later publish retries.
+		if result.Skipped == nil {
+			result.Skipped = make(map[string]error)
+		}
+		result.Skipped[name] = err
+	}
+}
+
+// listCacheDirectoryNames returns the names in directory, unsorted.
+func listCacheDirectoryNames(directory *os.Root) ([]string, error) {
 	handle, err := directory.Open(".")
 	if err != nil {
 		return nil, err
 	}
-	entries, err := handle.ReadDir(-1)
+	names, err := handle.Readdirnames(-1)
 	_ = handle.Close()
+	return names, err
+}
+
+// listSearchStoreGroup returns the stores in directory that belong to group:
+// one candidate per key directory, plus each legacy <key>.sqlite file.
+func listSearchStoreGroup(ctx context.Context, directory *os.Root, directoryPath, group string) ([]searchStoreCandidate, error) {
+	names, err := listCacheDirectoryNames(directory)
 	if err != nil {
 		return nil, err
 	}
 	var candidates []searchStoreCandidate
-	for _, entry := range entries {
-		name := entry.Name()
-		if !searchStoreSidecarName(name) {
-			continue
+	for _, name := range names {
+		switch {
+		case searchStoreKeyDirName(name):
+			if candidate, ok := searchStoreKeyCandidate(ctx, directory, directoryPath, name, group); ok {
+				candidates = append(candidates, candidate)
+			}
+		case searchStoreSidecarName(name):
+			info, err := directory.Lstat(name)
+			if err != nil || !info.Mode().IsRegular() || pathMayRedirect(info) {
+				continue
+			}
+			storeGroup, tree, ok := readSearchStoreRetentionIdentity(ctx, filepath.Join(directoryPath, name))
+			if !ok || storeGroup != group {
+				continue
+			}
+			candidates = append(candidates, searchStoreCandidate{name: name, size: info.Size(), modTime: info.ModTime(), tree: tree})
 		}
-		info, err := directory.Lstat(name)
-		if err != nil || !info.Mode().IsRegular() || pathMayRedirect(info) {
-			continue
-		}
-		storeGroup, tree, ok := readSearchStoreRetentionIdentity(ctx, filepath.Join(directoryPath, name))
-		if !ok || storeGroup != group {
-			continue
-		}
-		candidates = append(candidates, searchStoreCandidate{name: name, size: info.Size(), modTime: info.ModTime(), tree: tree})
 	}
 	return candidates, nil
+}
+
+// searchStoreKeyCandidate is a key directory's retention candidate. Its
+// identity (group and tree) and its age come from the key's current
+// generation (orderSearchStoreGenerations against the key's gz entry); its
+// size is every generation's, since evicting the key removes them all.
+func searchStoreKeyCandidate(ctx context.Context, directory *os.Root, directoryPath, name, group string) (searchStoreCandidate, bool) {
+	info, err := directory.Lstat(name)
+	if err != nil || !info.IsDir() || pathMayRedirect(info) {
+		return searchStoreCandidate{}, false
+	}
+	generations, err := listSearchStoreGenerations(ctx, filepath.Join(directoryPath, name))
+	if err != nil || len(generations) == 0 {
+		return searchStoreCandidate{}, false
+	}
+	key := strings.TrimSuffix(name, searchStoreKeyDirSuffix)
+	var entryStamp *searchStoreEntryStamp
+	if stamp, err := currentSearchEntryStamp(cacheEntry{root: directoryPath, relative: key + ".json.gz"}); err == nil {
+		entryStamp = &stamp
+	}
+	orderSearchStoreGenerations(generations, entryStamp)
+	storeGroup, tree, ok := readSearchStoreRetentionIdentity(ctx, generations[0].path)
+	if !ok || storeGroup != group {
+		return searchStoreCandidate{}, false
+	}
+	candidate := searchStoreCandidate{name: name, modTime: generations[0].modTime, tree: tree}
+	for _, generation := range generations {
+		candidate.size += generation.size
+		candidate.generations = append(candidate.generations, generation.name)
+	}
+	return candidate, true
 }
 
 // readSearchStoreRetentionIdentity reads the group and tree a store was built

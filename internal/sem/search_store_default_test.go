@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -42,10 +43,10 @@ func TestPreindexHitSurfacesStoreRepairFailureAsWarning(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("want one complete entry, got %q", entries)
 	}
-	// A non-empty directory where the sidecar belongs: the meta check cannot
-	// open it, and the rebuild can neither remove it nor rename over it.
-	sidecar := strings.TrimSuffix(entries[0], ".json.gz") + ".sqlite"
-	if err := os.MkdirAll(filepath.Join(sidecar, "blocker"), 0o700); err != nil {
+	// A regular file where the store's key directory belongs: the lookup
+	// cannot list it, and the rebuild cannot open it as a directory.
+	keyDir := strings.TrimSuffix(entries[0], ".json.gz") + ".sqlite.d"
+	if err := os.WriteFile(keyDir, []byte("blocker"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -65,5 +66,45 @@ func TestPreindexHitSurfacesStoreRepairFailureAsWarning(t *testing.T) {
 	}
 	if found == nil || found.Detail == "" || found.Severity != "warning" {
 		t.Fatalf("repair failure not surfaced as a %s warning: %+v", SearchStoreUnavailableCode, snapshot.Header.Warnings)
+	}
+}
+
+// A publish that fails leaves the previous store serving the entry it still
+// matches. Break caught: the failure path deleting the live store, which sends
+// every lookup to the full snapshot load until the next successful index.
+func TestFailedStorePublishKeepsThePreviousStore(t *testing.T) {
+	fixture := indexFocusFixture(t)
+	entryPath := focusFixtureEntryPath(t, fixture)
+	entryBefore, _ := fileSHA256(t, entryPath)
+	beforeSearchStorePublish = func() error { return errors.New("publish refused by the test") }
+	t.Cleanup(func() { beforeSearchStorePublish = nil })
+
+	forced := fixture.options
+	forced.ForceRebuild = true
+	snapshot, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := false
+	for _, warning := range snapshot.Header.Warnings {
+		refused = refused || warning.Code == SearchStoreUnavailableCode
+	}
+	if !refused {
+		t.Fatal("premise: the publish must have failed")
+	}
+	if entryAfter, _ := fileSHA256(t, entryPath); entryAfter != entryBefore {
+		t.Fatal("premise: a rebuild at the same commit must rewrite the same entry bytes")
+	}
+
+	_, focused, _, err := LoadFocusedProviderSnapshot(t.Context(), fixture.repo, fixture.version,
+		fixture.options, fixture.cacheDir, false, leafCallsFocus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !focused {
+		t.Fatal("the failed publish removed the store that still matches the entry")
+	}
+	if _, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options); err != nil {
+		t.Fatalf("the previous store must still resolve: %v", err)
 	}
 }

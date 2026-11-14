@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -121,4 +122,28 @@ func TestFocusedLookupHashesAReplacedEntryWithTheSameSizeAndTime(t *testing.T) {
 	if focused {
 		t.Fatal("a replaced entry with the same size and modification time was trusted, and its old store answered")
 	}
+}
+
+// searchStoreFilesForTest lists every published store file (*.sqlite) under
+// root, sorted. It knows nothing of how stores are laid out beneath root.
+func searchStoreFilesForTest(t *testing.T, root string) []string {
+	t.Helper()
+	var paths []string
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(path, ".sqlite") {
+			paths = append(paths, path)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// commitSameTree makes an empty commit: HEAD moves, while its tree, and with
+// it the cache key, stays.
+func commitSameTree(t *testing.T, repo string) {
+	t.Helper()
+	git(t, repo, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "same tree")
 }

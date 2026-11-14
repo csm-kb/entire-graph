@@ -475,19 +475,23 @@ func TestStoreDescriptorRefusesAStoreKeyedUnderAnotherTree(t *testing.T) {
 
 	from := ancestorTestEntry(t, repo, cacheDir, ancestorTree)
 	to := ancestorTestEntry(t, repo, cacheDir, headTree)
-	for _, pair := range [][2]cacheEntry{{from, to}, {searchStoreEntryFor(from), searchStoreEntryFor(to)}} {
-		content, err := os.ReadFile(filepath.Join(pair[0].root, pair[0].relative))
+	copyFile := func(from, to string) {
+		t.Helper()
+		content, err := os.ReadFile(from)
 		if err != nil {
 			t.Fatal(err)
 		}
-		target := filepath.Join(pair[1].root, pair[1].relative)
-		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(target, content, 0o600); err != nil {
+		if err := os.WriteFile(to, content, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
+	copyFile(filepath.Join(from.root, from.relative), filepath.Join(to.root, to.relative))
+	fromStore, _ := ancestorTestStorePath(t, repo, cacheDir, ancestorTree)
+	toKeyDir := searchStoreKeyDirFor(to)
+	copyFile(fromStore, filepath.Join(toKeyDir.root, toKeyDir.relative, filepath.Base(fromStore)))
 
 	_, err := DescribeSearchStore(t.Context(), repo, ancestorTestVersion, cacheDir, ancestorTestOptions)
 	if !errors.Is(err, errSearchStoreNotExact) || errors.Is(err, ErrSearchStoreMissing) {

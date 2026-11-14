@@ -1861,8 +1861,8 @@ type searchSnapshotCounts struct {
 }
 
 // searchSnapshotCountsEntryFor is the ONE place the counts file's name is derived from its entry:
-// the entry's relative path with .counts.json replacing .json.gz, as searchStoreEntryFor derives
-// the sqlite sidecar. It does not end in .json.gz, so it is never taken for an entry.
+// the entry's relative path with .counts.json replacing .json.gz, as searchStoreKeyDirFor derives
+// the store's key directory. It does not end in .json.gz, so it is never taken for an entry.
 func searchSnapshotCountsEntryFor(entry cacheEntry) cacheEntry {
 	counts := entry
 	counts.relative = strings.TrimSuffix(entry.relative, ".json.gz") + ".counts.json"
@@ -1961,10 +1961,10 @@ func readSearchSnapshotCounts(entry cacheEntry) (symbols, relations int, ok bool
 // per-query artifacts whose JSON decode was never the cost the store exists to
 // remove, so building a store there would spend the build and the disk on
 // queries that had no problem. The sidecar never fails the write: the gz entry
-// is authoritative, and writeSearchStoreSidecar removes any previous sidecar
-// on failure so a stale one cannot outlive the entry it mirrored (readers also
-// verify the embedded digest). Its error is returned apart from the entry's,
-// as storeErr, for the caller to surface (withSearchStoreUnavailable).
+// is authoritative, and a failed store write leaves the previous store, which
+// readers serve only while its embedded digest still matches the entry. Its
+// error is returned apart from the entry's, as storeErr, for the caller to
+// surface (withSearchStoreUnavailable).
 func writeSearchSnapshotAndStore(ctx context.Context, entry cacheEntry, cache cachedSearchSnapshot) (storeErr, err error) {
 	if err := refuseTruncatedSnapshot(cache); err != nil {
 		return nil, err

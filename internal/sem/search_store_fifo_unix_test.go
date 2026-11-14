@@ -37,7 +37,11 @@ func TestSearchStoreReadersRejectFIFO(t *testing.T) {
 			}
 			err = readErr
 		case "full":
-			_, err = loadSearchStore(ctx, filepath.Join(entry.root, "entry.sqlite"), "")
+			if _, ok := loadSearchStoreForEntry(ctx, entry); ok {
+				err = nil
+			} else {
+				err = ErrSearchStoreMissing
+			}
 		default:
 			t.Fatalf("unknown reader %q", mode)
 		}
@@ -60,7 +64,12 @@ func TestSearchStoreReadersRejectFIFO(t *testing.T) {
 				}
 				t.Run(shape, func(t *testing.T) {
 					root := t.TempDir()
-					fifo := filepath.Join(root, "entry.sqlite")
+					keyDir := filepath.Join(root, "entry.sqlite.d")
+					if err := os.Mkdir(keyDir, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					generation := filepath.Join(keyDir, "0123456789abcdef.sqlite")
+					fifo := generation
 					if linked {
 						fifo = filepath.Join(root, "pipe")
 					}
@@ -68,7 +77,7 @@ func TestSearchStoreReadersRejectFIFO(t *testing.T) {
 						t.Fatal(err)
 					}
 					if linked {
-						if err := os.Symlink(fifo, filepath.Join(root, "entry.sqlite")); err != nil {
+						if err := os.Symlink(fifo, generation); err != nil {
 							t.Fatal(err)
 						}
 					}

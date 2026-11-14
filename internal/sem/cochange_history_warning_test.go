@@ -447,10 +447,11 @@ func TestStoreAndContextDoNotServeEntriesWrittenBeforeTheCochangeWarning(t *test
 	stale, current = staleEntry(cacheDir)
 	// Only the older builds' entries remain: what a cache looks like on the first
 	// run of this build.
-	for _, path := range []string{current.relative, searchStoreEntryFor(current).relative} {
-		if err := os.Remove(filepath.Join(current.root, path)); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.Remove(filepath.Join(current.root, current.relative)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(current.root, searchStoreKeyDirFor(current).relative)); err != nil {
+		t.Fatal(err)
 	}
 	for _, previous := range searchCacheVersionsBeforeCochangeWarning {
 		key, err := searchSnapshotKeyForVersions(previous, SchemaVersion, repo, stale.Snapshot.Header.RepoKey,

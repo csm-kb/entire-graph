@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,25 +43,52 @@ func retentionTestKey(index int) string {
 	return fmt.Sprintf("%064x", index)
 }
 
-// publishRetentionTestStore writes the gz entry and publishes its sidecar the
-// way production does, and returns the sidecar's path.
-func publishRetentionTestStore(t *testing.T, cacheDir, key string, cache *cachedSearchSnapshot, digest string) string {
+// writeAndPublishSearchStore writes key's gz entry under version and publishes
+// its store the way production does, with the entry's real digest.
+func writeAndPublishSearchStore(t *testing.T, cacheDir, version, key string, cache *cachedSearchSnapshot) {
 	t.Helper()
-	entry, err := newCacheEntry(cacheDir, "search", retentionTestVersion, key)
+	entry, err := newCacheEntry(cacheDir, "search", version, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := writeSearchSnapshot(entry, *cache); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeSearchStoreSidecar(t.Context(), entry, digest, cache); err != nil {
+	digest, err := entry.digest()
+	if err != nil {
 		t.Fatal(err)
 	}
-	return retentionTestStorePath(cacheDir, key)
+	if err := writeSearchStoreSidecar(t.Context(), entry, digest.String(), cache); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func retentionTestStorePath(cacheDir, key string) string {
-	return filepath.Join(cacheDir, "search", retentionTestVersion, key+".sqlite")
+// publishSearchStoreAt is writeAndPublishSearchStore, returning the store file
+// the publish added under cacheDir. It must be the only publish in flight.
+func publishSearchStoreAt(t *testing.T, cacheDir, version, key string, cache *cachedSearchSnapshot) string {
+	t.Helper()
+	before := map[string]bool{}
+	for _, path := range searchStoreFilesForTest(t, cacheDir) {
+		before[path] = true
+	}
+	writeAndPublishSearchStore(t, cacheDir, version, key, cache)
+	var added []string
+	for _, path := range searchStoreFilesForTest(t, cacheDir) {
+		if !before[path] {
+			added = append(added, path)
+		}
+	}
+	if len(added) != 1 {
+		t.Fatalf("publishing %s added %v, want exactly one store", key, added)
+	}
+	return added[0]
+}
+
+// publishRetentionTestStore publishes under the retention test version and
+// returns the published store's path.
+func publishRetentionTestStore(t *testing.T, cacheDir, key string, cache *cachedSearchSnapshot) string {
+	t.Helper()
+	return publishSearchStoreAt(t, cacheDir, retentionTestVersion, key, cache)
 }
 
 func ageRetentionTestStore(t *testing.T, path string, at time.Time) {
@@ -71,27 +98,10 @@ func ageRetentionTestStore(t *testing.T, path string, at time.Time) {
 	}
 }
 
+// retentionTestStores lists every store file under cacheDir, sorted.
 func retentionTestStores(t *testing.T, cacheDir string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(cacheDir, "search", retentionTestVersion, "*.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	names := make([]string, 0, len(matches))
-	for _, match := range matches {
-		names = append(names, filepath.Base(match))
-	}
-	sort.Strings(names)
-	return names
-}
-
-func retentionTestNames(keys ...string) []string {
-	names := make([]string, 0, len(keys))
-	for _, key := range keys {
-		names = append(names, key+".sqlite")
-	}
-	sort.Strings(names)
-	return names
+	return searchStoreFilesForTest(t, cacheDir)
 }
 
 func openRetentionTestDirectory(t *testing.T, cacheDir string) (*os.Root, string) {
@@ -118,18 +128,21 @@ func TestSearchStoreRetentionKeepsNewestKPerGroup(t *testing.T) {
 	cacheDir := t.TempDir()
 	base := time.Now().Add(-time.Hour)
 
-	other := publishRetentionTestStore(t, cacheDir, retentionTestKey(100), newCache("gh/acme/other", "prefix:", "tree-o"), "digest-o")
+	other := publishRetentionTestStore(t, cacheDir, retentionTestKey(100), newCache("gh/acme/other", "prefix:", "tree-o"))
 	ageRetentionTestStore(t, other, base)
+	var published []string
 	for index := 1; index <= 2; index++ {
-		path := publishRetentionTestStore(t, cacheDir, retentionTestKey(index), newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index)), "digest")
+		path := publishRetentionTestStore(t, cacheDir, retentionTestKey(index), newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index)))
 		ageRetentionTestStore(t, path, base.Add(time.Duration(index)*time.Minute))
+		published = append(published, path)
 	}
-	if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(1), retentionTestKey(2), retentionTestKey(100)); !equalStrings(got, want) {
+	p1, p2 := published[0], published[1]
+	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{other, p1, p2}); !equalStrings(got, want) {
 		t.Fatalf("premise: K stores must all survive, got %v want %v", got, want)
 	}
 
-	publishRetentionTestStore(t, cacheDir, retentionTestKey(3), newCache("gh/acme/widget", "prefix:", "tree-3"), "digest")
-	if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(2), retentionTestKey(3), retentionTestKey(100)); !equalStrings(got, want) {
+	p3 := publishRetentionTestStore(t, cacheDir, retentionTestKey(3), newCache("gh/acme/widget", "prefix:", "tree-3"))
+	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{other, p2, p3}); !equalStrings(got, want) {
 		t.Fatalf("after K+1 stores: got %v, want the newest two of the group plus the other group's store %v", got, want)
 	}
 	for _, index := range []int{1, 2, 3, 100} {
@@ -150,10 +163,10 @@ func TestSearchStoreRetentionNeverEvictsPublishedOrHeadStore(t *testing.T) {
 
 	t.Run("published", func(t *testing.T) {
 		cacheDir := t.TempDir()
-		newer := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"), "digest")
+		newer := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
 		ageRetentionTestStore(t, newer, time.Now().Add(time.Hour))
-		publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"), "digest")
-		if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(1), retentionTestKey(2)); !equalStrings(got, want) {
+		p2 := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
+		if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{newer, p2}); !equalStrings(got, want) {
 			t.Fatalf("the newest store and the one just published must both survive: got %v want %v", got, want)
 		}
 	})
@@ -174,12 +187,12 @@ func TestSearchStoreRetentionNeverEvictsPublishedOrHeadStore(t *testing.T) {
 		}
 		cacheDir := t.TempDir()
 		base := time.Now().Add(-time.Hour)
-		head := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), inRepo(headTree), "digest")
+		head := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), inRepo(headTree))
 		ageRetentionTestStore(t, head, base)
-		older := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), inRepo("tree-older"), "digest")
+		older := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), inRepo("tree-older"))
 		ageRetentionTestStore(t, older, base.Add(time.Minute))
-		publishRetentionTestStore(t, cacheDir, retentionTestKey(3), inRepo("tree-elsewhere"), "digest")
-		if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(1), retentionTestKey(3)); !equalStrings(got, want) {
+		p3 := publishRetentionTestStore(t, cacheDir, retentionTestKey(3), inRepo("tree-elsewhere"))
+		if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{head, p3}); !equalStrings(got, want) {
 			t.Fatalf("HEAD's store must survive a publish for another tree: got %v want %v", got, want)
 		}
 	})
@@ -222,9 +235,9 @@ func TestSearchStoreRetentionReaderHoldingStoreKeepsReading(t *testing.T) {
 	newCache := retentionTestCache(t)
 	cacheDir := t.TempDir()
 	heldCache := newCache("gh/acme/widget", "prefix:", "tree-1")
-	held := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), heldCache, "digest")
+	held := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), heldCache)
 	ageRetentionTestStore(t, held, time.Now().Add(-time.Hour))
-	publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"), "digest")
+	publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
 
 	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(held)+"?immutable=1&mode=ro")
 	if err != nil {
@@ -263,6 +276,107 @@ func TestSearchStoreRetentionReaderHoldingStoreKeepsReading(t *testing.T) {
 	}
 }
 
+// A reader holding the current store does not block the next publish: the
+// republished entry gets its store under a new path, and the held connection
+// keeps reading the store it opened. Break caught: publishing by renaming over
+// the held file, which Windows refuses ("Access is denied") and which leaves
+// the descriptor's path unchanged on every platform.
+func TestSearchStorePublishesWhileAReaderHoldsTheStore(t *testing.T) {
+	fixture := indexFocusFixture(t)
+	before, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(before.Path)+"?immutable=1&mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
+	var version string
+	if err := readSearchStoreMetaKey(t.Context(), db, "store_version", &version); err != nil || version != searchStoreVersion {
+		t.Fatalf("premise: the reader must hold the store open, got %q (%v)", version, err)
+	}
+
+	commitSameTree(t, fixture.repo)
+	head := gitInput(t, fixture.repo, "", "rev-parse", "HEAD")
+	forced := fixture.options
+	forced.ForceRebuild = true
+	snapshot, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, warning := range snapshot.Header.Warnings {
+		if warning.Code == SearchStoreUnavailableCode {
+			t.Fatalf("the publish failed while a reader held the store: %s", warning.Detail)
+		}
+	}
+	after, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Commit != head || after.Path == before.Path {
+		t.Fatalf("the republished store must be described for %s at a new path, got commit %s path %s (was %s)", head, after.Commit, after.Path, before.Path)
+	}
+	var symbols int
+	if err := db.QueryRowContext(t.Context(), "SELECT count(*) FROM brain_symbols_v1").Scan(&symbols); err != nil || symbols != before.Symbols || symbols == 0 {
+		t.Fatalf("the held connection must keep reading its store: got %d symbols (%v), want %d", symbols, err, before.Symbols)
+	}
+}
+
+// The current store is the one recorded against the entry now on disk,
+// whatever the clocks say. After a backward clock step leaves the superseded
+// store newer by modification time, a lookup still takes the current one.
+// Break caught: a resolver that picks the newest store by modification time,
+// which here is the superseded store, built from other bytes: a miss.
+func TestSearchStoreCurrentGenerationSurvivesABackwardClockStep(t *testing.T) {
+	fixture := indexFocusFixture(t)
+	first, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the superseded store through the republish, as a reader holding it
+	// on Windows would.
+	removeSearchStoreSidecar = func(directory *os.Root, name string) error {
+		if name == filepath.Base(first.Path) {
+			return &fs.PathError{Op: "remove", Path: name, Err: errors.New("held by a reader")}
+		}
+		return directory.Remove(name)
+	}
+	t.Cleanup(func() { removeSearchStoreSidecar = (*os.Root).Remove })
+
+	commitSameTree(t, fixture.repo)
+	forced := fixture.options
+	forced.ForceRebuild = true
+	if _, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	second, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := searchStoreFilesForTest(t, fixture.cacheDir); !equalStrings(got, sortedPaths([]string{first.Path, second.Path})) {
+		t.Fatalf("premise: both stores must be on disk, got %v (first %s, second %s)", got, first.Path, second.Path)
+	}
+	firstInfo, err := os.Stat(first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlier := firstInfo.ModTime().Add(-time.Hour)
+	if err := os.Chtimes(second.Path, earlier, earlier); err != nil {
+		t.Fatal(err)
+	}
+
+	_, focused, _, err := LoadFocusedProviderSnapshot(t.Context(), fixture.repo, fixture.version,
+		fixture.options, fixture.cacheDir, false, leafCallsFocus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !focused {
+		t.Fatal("after a backward clock step the lookup missed the current store")
+	}
+}
+
 // A removal the platform refuses (Windows: another process has the store open)
 // skips that store, evicts the rest, and never fails the publish.
 func TestSearchStoreRetentionSkipsStoreThePlatformCannotDelete(t *testing.T) {
@@ -271,9 +385,9 @@ func TestSearchStoreRetentionSkipsStoreThePlatformCannotDelete(t *testing.T) {
 	newCache := retentionTestCache(t)
 	cacheDir := t.TempDir()
 	base := time.Now().Add(-time.Hour)
-	oldest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"), "digest")
+	oldest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
 	ageRetentionTestStore(t, oldest, base)
-	held := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"), "digest")
+	held := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
 	ageRetentionTestStore(t, held, base.Add(time.Minute))
 
 	sharingViolation := errors.New("The process cannot access the file because it is being used by another process.")
@@ -290,11 +404,11 @@ func TestSearchStoreRetentionSkipsStoreThePlatformCannotDelete(t *testing.T) {
 	// The undeletable store sorts first among those evicted, so the pass has
 	// to carry on past the refusal to evict the oldest.
 	t.Setenv(searchStoreKeepEnv, "1")
-	publishRetentionTestStore(t, cacheDir, retentionTestKey(3), newCache("gh/acme/widget", "prefix:", "tree-3"), "digest")
+	p3 := publishRetentionTestStore(t, cacheDir, retentionTestKey(3), newCache("gh/acme/widget", "prefix:", "tree-3"))
 	if refused.Load() == 0 {
 		t.Fatal("premise: the pass never tried to remove the held store")
 	}
-	if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(2), retentionTestKey(3)); !equalStrings(got, want) {
+	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{held, p3}); !equalStrings(got, want) {
 		t.Fatalf("the undeletable store must survive and the pass must still evict the rest: got %v want %v", got, want)
 	}
 }
@@ -306,7 +420,7 @@ func TestSearchStoreRetentionWithoutLockPublishesButNeverEvicts(t *testing.T) {
 	t.Setenv(searchStoreKeepEnv, "1")
 	newCache := retentionTestCache(t)
 	cacheDir := t.TempDir()
-	oldest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"), "digest")
+	oldest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
 	ageRetentionTestStore(t, oldest, time.Now().Add(-time.Hour))
 
 	directory, _ := openRetentionTestDirectory(t, cacheDir)
@@ -322,33 +436,33 @@ func TestSearchStoreRetentionWithoutLockPublishesButNeverEvicts(t *testing.T) {
 	searchStoreRetentionLockWait = 50 * time.Millisecond
 	t.Cleanup(func() { searchStoreRetentionLockWait = previous })
 
-	publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"), "digest")
-	if got, want := retentionTestStores(t, cacheDir), retentionTestNames(retentionTestKey(1), retentionTestKey(2)); !equalStrings(got, want) {
+	p2 := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
+	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{oldest, p2}); !equalStrings(got, want) {
 		t.Fatalf("a publish without the lock must publish and evict nothing: got %v want %v", got, want)
 	}
 }
 
-// A writer republishing a store while another process's eviction pass has
-// already chosen to remove that name must win: the pass holds the retention
-// lock from listing to removal, so the rename lands only after it. The fixture
-// forces the interleaving: the writer reaches its publish while the pass sits
-// between choosing and removing.
+// A store republished while another publish's eviction pass has already
+// chosen its key survives that pass: the pass removes only the store names it
+// listed, and the republish lands under a new name. The fixture forces the
+// interleaving: the writer reaches its publish while the pass sits between
+// choosing and removing.
 func TestSearchStoreRetentionRepublishDuringEvictionSurvives(t *testing.T) {
 	t.Setenv(searchStoreEnv, "1")
 	t.Setenv(searchStoreKeepEnv, "1")
 	newCache := retentionTestCache(t)
 	cacheDir := t.TempDir()
-	base := time.Now().Add(-time.Hour)
-	target := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"), "digest-old")
-	ageRetentionTestStore(t, target, base)
+	target := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
+	ageRetentionTestStore(t, target, time.Now().Add(-time.Hour))
 
 	var armed atomic.Bool
 	aboutToPublish := make(chan struct{})
 	published := make(chan struct{})
-	beforeSearchStorePublish = func() {
+	beforeSearchStorePublish = func() error {
 		if armed.Load() {
 			close(aboutToPublish)
 		}
+		return nil
 	}
 	afterSearchStorePublish = func() {
 		if armed.Load() {
@@ -356,16 +470,29 @@ func TestSearchStoreRetentionRepublishDuringEvictionSurvives(t *testing.T) {
 		}
 	}
 	writerDone := make(chan error, 1)
+	var republishedDigest string
 	var once sync.Once
 	beforeSearchStoreEvictionRemove = func() {
 		once.Do(func() {
 			armed.Store(true)
 			go func() {
-				entry, err := newCacheEntry(cacheDir, "search", retentionTestVersion, retentionTestKey(1))
-				if err == nil {
-					err = writeSearchStoreSidecar(t.Context(), entry, "digest-new", newCache("gh/acme/widget", "prefix:", "tree-1"))
-				}
-				writerDone <- err
+				writerDone <- func() error {
+					entry, err := newCacheEntry(cacheDir, "search", retentionTestVersion, retentionTestKey(1))
+					if err != nil {
+						return err
+					}
+					republish := *newCache("gh/acme/widget", "prefix:", "tree-1")
+					republish.Commit = "commit-republished"
+					if err := writeSearchSnapshot(entry, republish); err != nil {
+						return err
+					}
+					digest, err := entry.digest()
+					if err != nil {
+						return err
+					}
+					republishedDigest = digest.String()
+					return writeSearchStoreSidecar(t.Context(), entry, republishedDigest, &republish)
+				}()
 			}()
 			select {
 			case <-aboutToPublish:
@@ -381,27 +508,29 @@ func TestSearchStoreRetentionRepublishDuringEvictionSurvives(t *testing.T) {
 		beforeSearchStorePublish, afterSearchStorePublish, beforeSearchStoreEvictionRemove = nil, nil, nil
 	})
 
-	publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"), "digest")
+	writeAndPublishSearchStore(t, cacheDir, retentionTestVersion, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
 	if err := <-writerDone; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(target); err != nil {
-		t.Fatalf("the store republished during the eviction pass was removed by it: %v", err)
+	for _, path := range retentionTestStores(t, cacheDir) {
+		db, err := sql.Open("sqlite", "file:"+sqliteURLPath(path)+"?immutable=1&mode=ro")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var digest string
+		readErr := readSearchStoreMetaKey(t.Context(), db, "entry_digest", &digest)
+		_ = db.Close()
+		if readErr == nil && digest == republishedDigest {
+			return
+		}
 	}
-	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(target)+"?immutable=1&mode=ro")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var digest string
-	if err := readSearchStoreMetaKey(t.Context(), db, "entry_digest", &digest); err != nil || digest != "digest-new" {
-		t.Fatalf("surviving store must be the republished one: digest %q (%v)", digest, err)
-	}
+	t.Fatalf("the store republished during the eviction pass was removed by it (want a store recording %s, have %v)", republishedDigest, retentionTestStores(t, cacheDir))
 }
 
 // Concurrent publishers into one group, run under -race in CI's local gate:
-// every pass is serialized, nothing fails, no temporary is left behind, and the
-// newest K stores by publish time are all present.
+// nothing fails and no temporary is left behind. After one more publish the
+// window holds exactly the newest K stores by publish time, so no concurrent
+// pass evicted one of the newest.
 func TestSearchStoreRetentionConcurrentPublishers(t *testing.T) {
 	t.Setenv(searchStoreEnv, "1")
 	t.Setenv(searchStoreKeepEnv, "2")
@@ -413,13 +542,12 @@ func TestSearchStoreRetentionConcurrentPublishers(t *testing.T) {
 	afterSearchStorePublish = func() {
 		mu.Lock()
 		defer mu.Unlock()
-		for index := 1; index <= 6; index++ {
-			name := retentionTestKey(index) + ".sqlite"
-			if _, seen := publishedAt[name]; seen {
+		for _, path := range searchStoreFilesForTest(t, cacheDir) {
+			if _, seen := publishedAt[path]; seen {
 				continue
 			}
-			if info, err := os.Stat(filepath.Join(cacheDir, "search", retentionTestVersion, name)); err == nil {
-				publishedAt[name] = info.ModTime()
+			if info, err := os.Stat(path); err == nil {
+				publishedAt[path] = info.ModTime()
 			}
 		}
 	}
@@ -431,7 +559,13 @@ func TestSearchStoreRetentionConcurrentPublishers(t *testing.T) {
 		group.Go(func() {
 			entry, err := newCacheEntry(cacheDir, "search", retentionTestVersion, retentionTestKey(index))
 			if err == nil {
-				err = writeSearchStoreSidecar(t.Context(), entry, "digest", newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index)))
+				cache := newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index))
+				if err = writeSearchSnapshot(entry, *cache); err == nil {
+					var digest cacheDigest
+					if digest, err = entry.digest(); err == nil {
+						err = writeSearchStoreSidecar(t.Context(), entry, digest.String(), cache)
+					}
+				}
 			}
 			errs <- err
 		})
@@ -443,33 +577,27 @@ func TestSearchStoreRetentionConcurrentPublishers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(publishedAt) != 6 {
-		t.Fatalf("premise: every publish must be observed, got %d", len(publishedAt))
-	}
-	names := make([]string, 0, len(publishedAt))
-	for name := range publishedAt {
-		names = append(names, name)
-	}
-	sort.Slice(names, func(i, j int) bool {
-		if !publishedAt[names[i]].Equal(publishedAt[names[j]]) {
-			return publishedAt[names[i]].After(publishedAt[names[j]])
+	newest := ""
+	for path, at := range publishedAt {
+		if newest == "" || at.After(publishedAt[newest]) || (at.Equal(publishedAt[newest]) && path < newest) {
+			newest = path
 		}
-		return names[i] < names[j]
+	}
+	if newest == "" {
+		t.Fatal("premise: no publish was observed")
+	}
+
+	last := publishRetentionTestStore(t, cacheDir, retentionTestKey(7), newCache("gh/acme/widget", "prefix:", "tree-7"))
+	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{newest, last}); !equalStrings(got, want) {
+		t.Fatalf("want the newest concurrent store and the last one, got %v want %v", got, want)
+	}
+	var temporaries []string
+	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(path, ".tmp") {
+			temporaries = append(temporaries, path)
+		}
+		return err
 	})
-	survivors := retentionTestStores(t, cacheDir)
-	if len(survivors) < 2 || len(survivors) > 3 {
-		t.Fatalf("want K stores plus at most the last publisher's own, got %v", survivors)
-	}
-	present := map[string]bool{}
-	for _, name := range survivors {
-		present[name] = true
-	}
-	for _, name := range names[:2] {
-		if !present[name] {
-			t.Fatalf("newest store %s was evicted; survivors %v, newest-first %v", name, survivors, names)
-		}
-	}
-	temporaries, _ := filepath.Glob(filepath.Join(cacheDir, "search", retentionTestVersion, ".store-*"))
 	if len(temporaries) != 0 {
 		t.Fatalf("temporaries left behind: %v", temporaries)
 	}
@@ -508,7 +636,7 @@ func TestSearchStoreRetentionKeepOverride(t *testing.T) {
 	newCache := retentionTestCache(t)
 	cacheDir := t.TempDir()
 	for index := 1; index <= 4; index++ {
-		publishRetentionTestStore(t, cacheDir, retentionTestKey(index), newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index)), "digest")
+		publishRetentionTestStore(t, cacheDir, retentionTestKey(index), newCache("gh/acme/widget", "prefix:", fmt.Sprintf("tree-%d", index)))
 	}
 	if got := retentionTestStores(t, cacheDir); len(got) != 4 {
 		t.Fatalf("retention off must evict nothing, got %v", got)
