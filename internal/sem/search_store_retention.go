@@ -161,8 +161,8 @@ func searchStoreSidecarName(name string) bool {
 }
 
 // newSearchStoreRetention builds the policy for publishing store, or reports
-// false when retention is off. It resolves the publishing checkout's HEAD tree
-// here.
+// false when retention is off. It resolves the publishing checkout's HEAD tree,
+// which the window protects.
 func newSearchStoreRetention(ctx context.Context, store cacheEntry, cache *cachedSearchSnapshot) (searchStoreRetention, bool) {
 	keep := resolveSearchStoreKeep()
 	if keep <= 0 {
@@ -225,17 +225,21 @@ func sweepSearchStoreKeyDir(ctx context.Context, directory *os.Root, directoryPa
 	if generationCount < 2 && len(temporaries) == 0 {
 		return
 	}
-	key := strings.TrimSuffix(name, searchStoreKeyDirSuffix)
-	entryStamp, err := currentSearchEntryStamp(cacheEntry{root: directoryPath, relative: key + ".json.gz"})
-	if err != nil {
-		return
-	}
 	keyDir, err := openCacheComponent(directory, name, (*os.Root).OpenRoot)
 	if err != nil {
 		return
 	}
 	defer keyDir.Close()
+	// List, then stamp, as the resolver does. A generation listed here was
+	// published from an entry written before the stamp is taken, so a publish
+	// landing in between can never be ordered against a stale stamp and
+	// removed as superseded.
 	generations, err := listSearchStoreGenerations(ctx, keyDirPath)
+	if err != nil {
+		return
+	}
+	key := strings.TrimSuffix(name, searchStoreKeyDirSuffix)
+	entryStamp, err := currentSearchEntryStamp(cacheEntry{root: directoryPath, relative: key + ".json.gz"})
 	if err != nil {
 		return
 	}

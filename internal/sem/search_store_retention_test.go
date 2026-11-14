@@ -278,9 +278,12 @@ func TestSearchStoreRetentionReaderHoldingStoreKeepsReading(t *testing.T) {
 
 // A reader holding the current store does not block the next publish: the
 // republished entry gets its store under a new path, and the held connection
-// keeps reading the store it opened. Break caught: publishing by renaming over
-// the held file, which Windows refuses ("Access is denied") and which leaves
-// the descriptor's path unchanged on every platform.
+// keeps reading the store it opened. On POSIX the superseded store is unlinked
+// at once; everywhere it is gone after the reader closes and another publish
+// runs. Break caught: publishing by renaming over the held file, which Windows
+// refuses ("Access is denied") and which leaves the descriptor's path unchanged
+// on every platform. Break caught: a publish that never sweeps the superseded
+// store, or never retries one a reader held.
 func TestSearchStorePublishesWhileAReaderHoldsTheStore(t *testing.T) {
 	fixture := indexFocusFixture(t)
 	before, err := DescribeSearchStore(t.Context(), fixture.repo, fixture.version, fixture.cacheDir, fixture.options)
