@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"os"
@@ -66,6 +67,48 @@ func TestSearchStoreRoundTripsSnapshot(t *testing.T) {
 	// fidelity regression could hide behind a test-side normalizer.
 	if !reflect.DeepEqual(fromStore, fromJSON) {
 		t.Fatal(diffSearchStoreCaches(t, fromStore, fromJSON))
+	}
+}
+
+// Two builds of the same snapshot must write the same bytes: the store is a
+// derivative of the entry, so a rebuild of an unchanged tree must not look like
+// a change. Go randomizes map order per range loop, so one pair of builds can
+// match by chance; several builds compared against the first make a regression
+// to map-ordered inserts show up.
+func TestSearchStoreBuildIsByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	// Mutual recursion through parameters yields one-sided DATA_FLOWS evidence
+	// under the full profile, so the snapshot carries several unmerged edges.
+	if err := os.WriteFile(filepath.Join(dir, "flow.go"), []byte("package flow\n\nfunc alpha(a int) int {\n\treturn bravo(a)\n}\n\nfunc bravo(b int) int {\n\tvalue := alpha(b)\n\treturn value\n}\n\nfunc charlie(c int) int {\n\treturn delta(c)\n}\n\nfunc delta(d int) int {\n\tvalue := charlie(d)\n\treturn value\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), dir, "store-test", ProviderSnapshotOptions{Worktree: true, Profile: ProfileFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.unmergedDataFlowEdges) < 2 {
+		t.Fatalf("fixture has %d unmerged data-flow edges, want at least 2", len(snapshot.unmergedDataFlowEdges))
+	}
+	cache := newCachedSearchSnapshot("store-test", "commit-a", "tree-a", ProviderSnapshotOptions{Profile: ProfileFull}, snapshot, t.Context())
+	stamp := &searchStoreEntryStamp{Size: 1234, ModTimeNS: 5678}
+
+	build := func() []byte {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "store.sqlite")
+		if err := buildSearchStore(t.Context(), path, "digest-a", stamp, &cache); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	first := build()
+	for index := 1; index < 8; index++ {
+		if got := build(); !bytes.Equal(got, first) {
+			t.Fatalf("build %d of the same snapshot wrote different bytes than build 0 (%d vs %d bytes)", index, len(got), len(first))
+		}
 	}
 }
 

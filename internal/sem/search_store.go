@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
@@ -219,8 +221,8 @@ func buildSearchStore(ctx context.Context, path, entryDigest string, stamp *sear
 	if stamp != nil {
 		metaValues["entry_stamp"] = stamp
 	}
-	for key, value := range metaValues {
-		encoded, err := json.Marshal(value)
+	for _, key := range slices.Sorted(maps.Keys(metaValues)) {
+		encoded, err := json.Marshal(metaValues[key])
 		if err != nil {
 			return err
 		}
@@ -370,7 +372,7 @@ func buildSearchStore(ctx context.Context, path, entryDigest string, stamp *sear
 		return err
 	}
 	defer putUnmerged.Close()
-	for key := range cache.Snapshot.unmergedDataFlowEdges {
+	for _, key := range slices.Sorted(maps.Keys(cache.Snapshot.unmergedDataFlowEdges)) {
 		fromID, toID, _ := strings.Cut(key, "\x00")
 		if _, err := putUnmerged.ExecContext(ctx, fromID, toID); err != nil {
 			return err
