@@ -116,17 +116,23 @@ func storeContextTokens(task string) []string {
 // fan-out is indexed. wantEntryDigest carries the same coherence contract as
 // loadSearchStore.
 func QuerySearchStoreContext(ctx context.Context, path, wantEntryDigest, task string, limit, testsLimit, relationsLimit int) (SearchStoreContext, error) {
-	result, _, err := querySearchStoreContext(ctx, path, wantEntryDigest, "", task, limit, testsLimit, relationsLimit, nil)
+	db, err := openSearchStoreForRead(path)
+	if err != nil {
+		return SearchStoreContext{}, err
+	}
+	defer db.Close()
+	result, _, err := querySearchStoreContext(ctx, db, wantEntryDigest, "", task, limit, testsLimit, relationsLimit, nil)
 	return result, err
 }
 
-// querySearchStoreContext is QuerySearchStoreContext plus the two inputs only
-// the ancestor path supplies. wantTree, when set, must equal the tree the
-// store records. excludeFiles, when non-nil, withholds every symbol, test and
+// querySearchStoreContext answers the request on db, an open store
+// connection the caller closes. wantEntryDigest, when set, must equal the
+// digest the store records. wantTree, when set, must equal the tree the store
+// records. excludeFiles, when non-nil, withholds every symbol, test and
 // relation that belongs to a file in the set, and the int counts what was
 // withheld (see StoreContextStale.ExcludedRecords). A nil excludeFiles runs
 // the exact query unchanged: the same scan and the same SQL.
-func querySearchStoreContext(ctx context.Context, path, wantEntryDigest, wantTree, task string, limit, testsLimit, relationsLimit int, excludeFiles map[string]struct{}) (SearchStoreContext, int, error) {
+func querySearchStoreContext(ctx context.Context, db *sql.DB, wantEntryDigest, wantTree, task string, limit, testsLimit, relationsLimit int, excludeFiles map[string]struct{}) (SearchStoreContext, int, error) {
 	if limit <= 0 {
 		limit = 12
 	}
@@ -140,11 +146,6 @@ func querySearchStoreContext(ctx context.Context, path, wantEntryDigest, wantTre
 	if len(tokens) == 0 {
 		return SearchStoreContext{}, 0, fmt.Errorf("task %q yields no searchable tokens", task)
 	}
-	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(path)+"?immutable=1&mode=ro")
-	if err != nil {
-		return SearchStoreContext{}, 0, err
-	}
-	defer db.Close()
 
 	var result SearchStoreContext
 	var storeVersion string
@@ -323,16 +324,22 @@ var ErrSearchStoreMissing = fmt.Errorf(
 	"search store not built for this commit: run `entire graph index --head` (with %s unset or 1)", searchStoreEnv)
 
 // LoadSearchStoreContext resolves the committed tree's complete search entry
-// and answers the context query from its sqlite sidecar. It never builds: a
-// missing sidecar (or one that does not match the current entry) returns
-// ErrSearchStoreMissing so the caller can degrade instead of paying a parse.
+// and answers the context query from its sqlite store, on the very connection
+// that verified it: a store a sweep removes after verification is still read
+// consistently, instead of failing a reopen. It never builds: a missing store
+// (or one that does not match the current entry) returns ErrSearchStoreMissing
+// so the caller can degrade instead of paying a parse.
 func LoadSearchStoreContext(ctx context.Context, repo, providerVersion, cacheDir, task string, options ProviderSnapshotOptions, limit, testsLimit, relationsLimit int) (SearchStoreContext, error) {
-	descriptor, err := DescribeSearchStore(ctx, repo, providerVersion, cacheDir, options)
+	key, tree, err := resolveSearchStoreRequest(ctx, repo, providerVersion, cacheDir, options)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
-	path, digest := descriptor.Path, descriptor.EntryDigest
-	result, err := QuerySearchStoreContext(ctx, path, digest, task, limit, testsLimit, relationsLimit)
+	_, db, err := openExactSearchStore(ctx, cacheDir, key, tree)
+	if err != nil {
+		return SearchStoreContext{}, err
+	}
+	defer db.Close()
+	result, _, err := querySearchStoreContext(ctx, db, "", "", task, limit, testsLimit, relationsLimit, nil)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
@@ -554,28 +561,7 @@ type SearchStoreDescriptor struct {
 // DescribeSearchStore never builds or scans a snapshot. It verifies the same
 // cache identity as context before handing out a read-only store capability.
 func DescribeSearchStore(ctx context.Context, repo, providerVersion, cacheDir string, options ProviderSnapshotOptions) (SearchStoreDescriptor, error) {
-	if cacheDir == "" {
-		return SearchStoreDescriptor{}, fmt.Errorf("store context requires a cache directory")
-	}
-	options.Worktree = false
-	options.OnlyFiles = nil
-	if options.Profile == "" {
-		options.Profile = ProfileFull
-	}
-	absRepo, err := filepath.Abs(repo)
-	if err != nil {
-		return SearchStoreDescriptor{}, err
-	}
-	options, err = CaptureProviderCachePolicy(absRepo, options)
-	if err != nil {
-		return SearchStoreDescriptor{}, err
-	}
-	_, tree, err := resolveCommittedHEAD(ctx, absRepo)
-	if err != nil {
-		return SearchStoreDescriptor{}, fmt.Errorf("resolve committed HEAD for store context: %w", err)
-	}
-	repositoryKey := repoKey(ctx, absRepo)
-	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
+	key, tree, err := resolveSearchStoreRequest(ctx, repo, providerVersion, cacheDir, options)
 	if err != nil {
 		return SearchStoreDescriptor{}, err
 	}
@@ -592,6 +578,39 @@ func DescribeSearchStore(ctx context.Context, repo, providerVersion, cacheDir st
 		return SearchStoreDescriptor{}, err
 	}
 	return result, nil
+}
+
+// resolveSearchStoreRequest is the cache key and tree that repo's committed
+// HEAD store is addressed by, under the request's provider version and
+// captured policy. The descriptor and the exact context path share it, so
+// both verify the same identity.
+func resolveSearchStoreRequest(ctx context.Context, repo, providerVersion, cacheDir string, options ProviderSnapshotOptions) (string, string, error) {
+	if cacheDir == "" {
+		return "", "", fmt.Errorf("store context requires a cache directory")
+	}
+	options.Worktree = false
+	options.OnlyFiles = nil
+	if options.Profile == "" {
+		options.Profile = ProfileFull
+	}
+	absRepo, err := filepath.Abs(repo)
+	if err != nil {
+		return "", "", err
+	}
+	options, err = CaptureProviderCachePolicy(absRepo, options)
+	if err != nil {
+		return "", "", err
+	}
+	_, tree, err := resolveCommittedHEAD(ctx, absRepo)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve committed HEAD for store context: %w", err)
+	}
+	repositoryKey := repoKey(ctx, absRepo)
+	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
+	if err != nil {
+		return "", "", err
+	}
+	return key, tree, nil
 }
 
 // exactSearchStore is a store sidecar verified against the key it was looked

@@ -111,7 +111,12 @@ func loadSearchStoreContextFromAncestor(ctx context.Context, repo, providerVersi
 	for _, path := range ancestor.stale.ChangedFiles {
 		exclude[path] = struct{}{}
 	}
-	result, excluded, err := querySearchStoreContext(ctx, ancestor.path, ancestor.entryDigest, ancestor.stale.AncestorTree,
+	db, err := openSearchStoreForRead(ancestor.path)
+	if err != nil {
+		return SearchStoreContext{}, &ancestorStoreRefusal{reason: "query", cause: err}
+	}
+	defer db.Close()
+	result, excluded, err := querySearchStoreContext(ctx, db, ancestor.entryDigest, ancestor.stale.AncestorTree,
 		task, limit, testsLimit, relationsLimit, exclude)
 	if err != nil {
 		return SearchStoreContext{}, &ancestorStoreRefusal{reason: "query", cause: err}
