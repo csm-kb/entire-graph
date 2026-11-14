@@ -322,6 +322,20 @@ func TestSearchStorePublishesWhileAReaderHoldsTheStore(t *testing.T) {
 	if err := db.QueryRowContext(t.Context(), "SELECT count(*) FROM brain_symbols_v1").Scan(&symbols); err != nil || symbols != before.Symbols || symbols == 0 {
 		t.Fatalf("the held connection must keep reading its store: got %d symbols (%v), want %d", symbols, err, before.Symbols)
 	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Lstat(before.Path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("POSIX: the superseded store must be unlinked by the publish, got %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(before.Path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the superseded store must be gone once its reader closed and another publish ran, got %v", err)
+	}
 }
 
 // The current store is the one recorded against the entry now on disk,
@@ -375,6 +389,15 @@ func TestSearchStoreCurrentGenerationSurvivesABackwardClockStep(t *testing.T) {
 	if !focused {
 		t.Fatal("after a backward clock step the lookup missed the current store")
 	}
+
+	// The next publish, of another key in the same cache version, sweeps this
+	// key too: it keeps the current store and removes the superseded one.
+	removeSearchStoreSidecar = (*os.Root).Remove
+	newCache := retentionTestCache(t)
+	other := publishSearchStoreAt(t, fixture.cacheDir, searchSnapshotCacheVersion, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
+	if got := searchStoreFilesForTest(t, fixture.cacheDir); !equalStrings(got, sortedPaths([]string{second.Path, other})) {
+		t.Fatalf("the sweep must keep the current store and remove the superseded one, got %v (current %s)", got, second.Path)
+	}
 }
 
 // A removal the platform refuses (Windows: another process has the store open)
@@ -410,35 +433,6 @@ func TestSearchStoreRetentionSkipsStoreThePlatformCannotDelete(t *testing.T) {
 	}
 	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{held, p3}); !equalStrings(got, want) {
 		t.Fatalf("the undeletable store must survive and the pass must still evict the rest: got %v want %v", got, want)
-	}
-}
-
-// A publish that cannot take the retention lock still publishes, and evicts
-// nothing: removal is only safe while no other publish can rename under it.
-func TestSearchStoreRetentionWithoutLockPublishesButNeverEvicts(t *testing.T) {
-	t.Setenv(searchStoreEnv, "1")
-	t.Setenv(searchStoreKeepEnv, "1")
-	newCache := retentionTestCache(t)
-	cacheDir := t.TempDir()
-	oldest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), newCache("gh/acme/widget", "prefix:", "tree-1"))
-	ageRetentionTestStore(t, oldest, time.Now().Add(-time.Hour))
-
-	directory, _ := openRetentionTestDirectory(t, cacheDir)
-	holder, err := openCacheLockFileIn(directory, searchStoreRetentionLockName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = holder.Close() })
-	if err := tryLockBuildLockFile(holder); err != nil {
-		t.Skipf("platform has no cache lock: %v", err)
-	}
-	previous := searchStoreRetentionLockWait
-	searchStoreRetentionLockWait = 50 * time.Millisecond
-	t.Cleanup(func() { searchStoreRetentionLockWait = previous })
-
-	p2 := publishRetentionTestStore(t, cacheDir, retentionTestKey(2), newCache("gh/acme/widget", "prefix:", "tree-2"))
-	if got, want := retentionTestStores(t, cacheDir), sortedPaths([]string{oldest, p2}); !equalStrings(got, want) {
-		t.Fatalf("a publish without the lock must publish and evict nothing: got %v want %v", got, want)
 	}
 }
 
@@ -640,5 +634,61 @@ func TestSearchStoreRetentionKeepOverride(t *testing.T) {
 	}
 	if got := retentionTestStores(t, cacheDir); len(got) != 4 {
 		t.Fatalf("retention off must evict nothing, got %v", got)
+	}
+}
+
+// Republishing one entry leaves one store, even with the recency window off:
+// superseded stores go on every publish, whatever
+// ENTIRE_GRAPH_SEARCH_STORE_KEEP says. Break caught: superseded stores
+// accumulating, one store-sized leak per republish.
+func TestSearchStoreRepublishLeavesOneStoreAtKeepZero(t *testing.T) {
+	t.Setenv(searchStoreKeepEnv, "0")
+	fixture := indexFocusFixture(t)
+	forced := fixture.options
+	forced.ForceRebuild = true
+	for range 3 {
+		if _, _, err := PreindexProviderSnapshot(t.Context(), fixture.repo, fixture.version, forced, fixture.cacheDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := searchStoreFilesForTest(t, fixture.cacheDir); len(got) != 1 {
+		t.Fatalf("want the current store only, got %v", got)
+	}
+}
+
+// A superseded store the platform refuses to delete (Windows: a reader holds
+// it) is removed by the next publish. Break caught: a refused removal that is
+// never retried, leaking one store per held republish.
+func TestSearchStoreSupersededRemovalIsRetried(t *testing.T) {
+	t.Setenv(searchStoreEnv, "1")
+	t.Setenv(searchStoreKeepEnv, "0")
+	newCache := retentionTestCache(t)
+	cacheDir := t.TempDir()
+	cache := newCache("gh/acme/widget", "prefix:", "tree-1")
+	held := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), cache)
+
+	var refused atomic.Int32
+	removeSearchStoreSidecar = func(directory *os.Root, name string) error {
+		if name == filepath.Base(held) {
+			refused.Add(1)
+			return &fs.PathError{Op: "remove", Path: name, Err: errors.New("The process cannot access the file because it is being used by another process.")}
+		}
+		return directory.Remove(name)
+	}
+	t.Cleanup(func() { removeSearchStoreSidecar = (*os.Root).Remove })
+
+	second := *cache
+	second.Commit = "commit-2"
+	publishRetentionTestStore(t, cacheDir, retentionTestKey(1), &second)
+	if refused.Load() == 0 {
+		t.Fatal("premise: the publish never tried to remove the superseded store")
+	}
+
+	removeSearchStoreSidecar = (*os.Root).Remove
+	third := *cache
+	third.Commit = "commit-3"
+	latest := publishRetentionTestStore(t, cacheDir, retentionTestKey(1), &third)
+	if got := retentionTestStores(t, cacheDir); !equalStrings(got, []string{latest}) {
+		t.Fatalf("the next publish must retry the refused removal and leave the current store only, got %v (current %s)", got, latest)
 	}
 }

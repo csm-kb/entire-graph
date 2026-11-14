@@ -153,9 +153,9 @@ func readSearchStoreRecordedStamp(ctx context.Context, path string) *searchStore
 // order is: a generation whose recorded stamp equals entryStamp (the gz entry
 // on disk now; nil when it could not be stamped), then the newer modification
 // time, then the lower name. The resolver serves the first, the superseded
-// sweep keeps it, and the retention window takes it as the key's identity, so
-// all three agree whatever the clocks say. The tie-break matches
-// planSearchStoreEviction's.
+// sweep (sweepSupersededSearchStores) keeps it, and the retention window takes
+// it as the key's identity, so all three agree whatever the clocks say. The
+// tie-break matches planSearchStoreEviction's.
 func orderSearchStoreGenerations(generations []searchStoreGeneration, entryStamp *searchStoreEntryStamp) {
 	matches := func(generation searchStoreGeneration) bool {
 		return entryStamp != nil && generation.stamp != nil && *generation.stamp == *entryStamp
@@ -175,6 +175,58 @@ func orderSearchStoreGenerations(generations []searchStoreGeneration, entryStamp
 		}
 		return strings.Compare(a.name, b.name)
 	})
+}
+
+// searchStoreGenerationRecorded reports whether a generation in the key
+// directory already mirrors this entry instance: it recorded stamp (file
+// identity included) and entryDigest at this build's store version. A second
+// build would only be swept again.
+func searchStoreGenerationRecorded(ctx context.Context, keyDirPath string, stamp searchStoreEntryStamp, entryDigest string) bool {
+	generations, err := listSearchStoreGenerations(ctx, keyDirPath)
+	if err != nil {
+		return false
+	}
+	for _, generation := range generations {
+		if generation.stamp == nil || *generation.stamp != stamp {
+			continue
+		}
+		db, err := openSearchStoreForRead(generation.path)
+		if err != nil {
+			continue
+		}
+		var version, digest string
+		recorded := readSearchStoreMetaKey(ctx, db, "store_version", &version) == nil &&
+			readSearchStoreMetaKey(ctx, db, "entry_digest", &digest) == nil &&
+			version == searchStoreVersion && digest == entryDigest
+		_ = db.Close()
+		if recorded {
+			return true
+		}
+	}
+	return false
+}
+
+// syncSearchStoreFile flushes a built store to stable storage before it is
+// published. The build runs with synchronous(OFF), and the meta check reads
+// only the meta rows, so without this a crash could leave a published store
+// whose data pages are zero or missing, undetected.
+func syncSearchStoreFile(directory *os.Root, name string) error {
+	file, err := directory.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// searchStoreTempName reports whether name is a store build's temporary: a
+// dot, 16 lowercase hex digits, .tmp.
+func searchStoreTempName(name string) bool {
+	stem, ok := strings.CutSuffix(name, ".tmp")
+	return ok && strings.HasPrefix(stem, ".") && isLowerHex(stem[1:], 16)
 }
 
 // currentSearchEntryStamp stamps the gz entry on disk now.

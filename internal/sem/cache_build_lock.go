@@ -130,8 +130,7 @@ func openCompleteBuildLockFile(cacheDir, family, version, key string) (*os.File,
 
 // openCacheLockFileIn opens, creating if needed, the lock file name inside an
 // already confined cache directory, and refuses anything but the regular file
-// the open actually returned. Both cache locks go through it: the per-key build
-// lock and the directory-wide search store retention lock.
+// the open actually returned. The per-key build lock goes through it.
 func openCacheLockFileIn(directory *os.Root, name string) (*os.File, error) {
 	if named, err := directory.Lstat(name); err == nil && !named.Mode().IsRegular() {
 		return nil, errors.New("cache build lock is not a regular file")

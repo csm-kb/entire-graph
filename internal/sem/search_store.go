@@ -730,15 +730,17 @@ func decodeSearchStoreParallel(count int, decode func(int) error) error {
 }
 
 // writeSearchStoreSidecar builds the sqlite store for an entry that was just
-// written with entryDigest. It goes through the same confined directory walk
-// every cache write uses, opens the key's directory (searchStoreKeyDirFor)
-// the same way, builds into a temporary there, and renames it to a fresh
+// written with entryDigest, and publishes it write-once: into a temporary in
+// the key's directory (searchStoreKeyDirFor), fsynced, then renamed to a fresh
 // generation name. The publish step never renames over or modifies a store,
-// so no reader holding one can make it fail. A failure removes only the
+// so no reader holding one can make it fail. It builds nothing when the entry
+// on disk is no longer the one entryDigest was taken from, or when a
+// generation already mirrors this entry instance, and it discards its build
+// when the entry is replaced while it runs. A failure removes only the
 // temporary: the previous generation keeps serving while its digest still
-// matches the entry. A successful publish then trims the stores of the same
-// repository and scope to the newest few (search_store_retention.go); the gz
-// entries are never trimmed.
+// matches the entry. After a publish, the superseded sweep and the retention
+// window remove what they may (search_store_retention.go); the gz entries are
+// never removed.
 func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest string, cache *cachedSearchSnapshot) error {
 	if !searchStoreEnabled() {
 		// The write is gated by the same flag as the read: with no reader, a
@@ -754,13 +756,29 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 	defer directory.Close()
 	keyDirEntry := searchStoreKeyDirFor(entry)
 	keyDirName := filepath.Base(keyDirEntry.relative)
+	created := directory.Mkdir(keyDirName, 0o700) == nil
 	keyDir, err := openCacheComponent(directory, keyDirName, (*os.Root).OpenRoot)
 	if err != nil {
 		return err
 	}
 	defer keyDir.Close()
+	if created {
+		// Best effort: a lost key directory after a crash only loses its
+		// stores, and the next publish rebuilds one.
+		_ = syncSearchStoreDirectory(directory)
+	}
+	stamp, changed, err := stampSearchEntry(entry, entryDigest)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return nil
+	}
 	directoryPath := filepath.Join(entry.root, filepath.Dir(entry.relative))
 	keyDirPath := filepath.Join(directoryPath, keyDirName)
+	if searchStoreGenerationRecorded(ctx, keyDirPath, stamp, entryDigest) {
+		return nil
+	}
 	temporary, temporaryName, err := createSearchStoreTemp(keyDir)
 	if err != nil {
 		return err
@@ -774,7 +792,15 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := buildSearchStore(ctx, filepath.Join(keyDirPath, temporaryName), entryDigest, stampSearchEntry(entry, entryDigest), cache); err != nil {
+	if err := buildSearchStore(ctx, filepath.Join(keyDirPath, temporaryName), entryDigest, &stamp, cache); err != nil {
+		return err
+	}
+	if current, err := currentSearchEntryStamp(entry); err != nil || current != stamp {
+		// The entry was replaced during the build: this store mirrors bytes no
+		// longer on disk, and the replacing writer publishes its own.
+		return nil
+	}
+	if err := syncSearchStoreFile(keyDir, temporaryName); err != nil {
 		return err
 	}
 	if beforeSearchStorePublish != nil {
@@ -782,25 +808,21 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 			return err
 		}
 	}
-	// Publish and trim under one hold of the retention lock. Without the lock
-	// the store is still published; only the eviction is skipped (see
-	// search_store_retention.go).
-	retention, retain := newSearchStoreRetention(ctx, keyDirEntry, cache)
-	var lock *completeBuildLock
-	if retain {
-		lock = acquireSearchStoreRetentionLock(ctx, directory)
-	}
-	defer lock.release()
-	if err := keyDir.Rename(temporaryName, newSearchStoreGenerationName()); err != nil {
+	name := newSearchStoreGenerationName()
+	if err := keyDir.Rename(temporaryName, name); err != nil {
 		return err
 	}
 	removeTemporary = false
+	// Best effort: the store is published and readable now; a lost name after
+	// a crash falls back to the previous generation or the full load.
+	_ = syncSearchStoreDirectory(keyDir)
 	if afterSearchStorePublish != nil {
 		afterSearchStorePublish()
 	}
-	if lock != nil {
-		// Best effort, like the store itself: the publish has succeeded, and a
-		// store that could not be trimmed now is trimmed by a later publish.
+	// Both passes are best effort, like the store itself: the publish has
+	// succeeded, and whatever they cannot remove now, a later publish does.
+	sweepSupersededSearchStores(ctx, directory, directoryPath, keyDirName, name, removeSearchStoreSidecar)
+	if retention, retain := newSearchStoreRetention(ctx, keyDirEntry, cache); retain {
 		_, _ = evictSearchStoreSidecars(ctx, directory, directoryPath, retention)
 	}
 	return nil
@@ -845,8 +867,9 @@ func repairSearchStoreSidecarForEntry(ctx context.Context, entry cacheEntry, tre
 // SearchStoreUnavailableCode names the header warning a command carries when
 // it tried to write the sqlite sidecar and could not: `index` on a hit (the
 // repair) or a miss, and a cold build by a `--head` lookup or `query`. The
-// command itself succeeded; the warning says why `graph store` reports
-// store_unavailable and why lookups on this tree take the full snapshot load.
+// command itself succeeded; the warning says why `graph store` may report
+// store_unavailable and why lookups on this tree may take the full snapshot
+// load.
 const SearchStoreUnavailableCode = "W_SEARCH_STORE_UNAVAILABLE"
 
 // IsRunWarning reports whether code names a warning about one run's own work
@@ -886,7 +909,7 @@ func searchStoreUnavailableWarning(err error) ProviderWarning {
 	return ProviderWarning{
 		Code:                 SearchStoreUnavailableCode,
 		Severity:             "warning",
-		EffectOnCompleteness: "none: the graph is complete, but its sqlite search store could not be written, so `graph store` and `graph context` report store_unavailable and lookups fall back to the full snapshot load (correct, slower)",
+		EffectOnCompleteness: "none: the graph is complete, but its sqlite search store could not be written, so lookups, `graph store` and `graph context` use the previous store if it still matches; otherwise lookups take the full snapshot load (correct, slower) and `graph store` and `graph context` report store_unavailable",
 		// Appended after the header's warnings were stamped, so it is stamped here.
 		EffectScope: DiagnosticEffectScope(SearchStoreUnavailableCode, ""),
 		Detail:      err.Error(),
@@ -974,32 +997,36 @@ func searchEntryStampOf(file *os.File) (searchStoreEntryStamp, error) {
 	return searchStoreEntryStamp{Size: info.Size(), ModTimeNS: info.ModTime().UnixNano(), FileID: id}, nil
 }
 
-// stampSearchEntry returns the entry's stamp for a sidecar that records
-// entryDigest, or nil. The entry is hashed here, once per sidecar write, so a
-// stamp is recorded only for an entry whose bytes are the digest's and whose
-// stamp held across the read: a stamp that does not provably belong to the
-// digest would let a lookup skip the hash for the wrong bytes.
-func stampSearchEntry(entry cacheEntry, entryDigest string) *searchStoreEntryStamp {
+// stampSearchEntry hashes the entry once and returns its stamp, for a store
+// that records entryDigest. changed reports an entry that is not the one
+// entryDigest was taken from: its bytes hash to another digest, or its stamp
+// moved during the read because another writer replaced it. That writer
+// publishes the store for its own bytes, so this one quietly builds nothing.
+// err reports an entry that cannot be read.
+func stampSearchEntry(entry cacheEntry, entryDigest string) (stamp searchStoreEntryStamp, changed bool, err error) {
 	file, err := entry.open()
 	if err != nil {
-		return nil
+		return searchStoreEntryStamp{}, false, err
 	}
 	defer file.Close()
 	before, err := searchEntryStampOf(file)
 	if err != nil {
-		return nil
+		return searchStoreEntryStamp{}, false, err
 	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
-		return nil
+		return searchStoreEntryStamp{}, false, err
 	}
 	after, err := searchEntryStampOf(file)
+	if err != nil {
+		return searchStoreEntryStamp{}, false, err
+	}
 	var digest cacheDigest
 	copy(digest[:], hash.Sum(nil))
-	if err != nil || after != before || digest.String() != entryDigest {
-		return nil
+	if after != before || digest.String() != entryDigest {
+		return searchStoreEntryStamp{}, true, nil
 	}
-	return &before
+	return before, false, nil
 }
 
 // loadSearchStoreForEntry serves the entry's snapshot from its current store

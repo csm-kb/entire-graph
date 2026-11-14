@@ -27,7 +27,7 @@ import (
 //   - the newest searchStoreKeep stores by modification time, which a publish
 //     sets, admitted newest first while their total stays within
 //     searchStoreRetainBytes; the single newest store is always admitted;
-//   - the store being published, wherever it sorts;
+//   - the key being published, wherever it sorts;
 //   - every store built for the publishing checkout's current HEAD tree, in
 //     any policy variant, so a writer for an older tree can never evict the
 //     store that checkout is reading now.
@@ -39,14 +39,22 @@ import (
 // share the limit instead; the HEAD rule keeps each variant's current store.
 //
 // Readers are never locked out. Graph's own readers and external consumers
-// (docs/store-contract.md) open a store by path, read-only and immutable, so
-// on POSIX an eviction unlinks the name while every open connection keeps
-// reading the same inode, and the next resolution reports the store missing,
-// which consumers already handle. Windows refuses to delete a file another
-// process holds open; that removal error skips the store, which a later
-// publish retries. Writers and evictors are serialized by
-// searchStoreRetentionLockName, so an eviction can never remove a store that
-// was republished under the same name after it was listed.
+// (docs/store-contract.md) open a store by path, read-only and immutable, and
+// a published store is never modified, renamed or renamed over: each publish
+// writes a new generation under a fresh name in its key's directory
+// (search_store_generation.go). A pass therefore only ever removes names it
+// listed, whose content cannot have changed since, and needs no lock against
+// publishers or other passes. On POSIX a removal unlinks the name while every
+// open connection keeps reading the same inode; Windows refuses to delete a
+// file another process holds open, and that removal error skips the store
+// until a later publish retries it.
+//
+// Two passes follow each publish. The superseded sweep
+// (sweepSupersededSearchStores), at any KEEP, removes every generation of
+// every key other than the key's current one and the one just published, and
+// temporaries older than searchStoreTempMaxAge. The window pass below, when
+// KEEP > 0, trims whole keys: one candidate per key directory, aged and
+// identified by its current generation, plus legacy <key>.sqlite files.
 const (
 	// searchStoreKeepEnv overrides searchStoreKeep. 0 or a negative value
 	// turns retention off, which is the behaviour before it existed.
@@ -65,17 +73,12 @@ const (
 	// only where one store passes about 340 MB, at which point keeping older
 	// copies costs more disk than rebuilding one from its gz entry costs time.
 	searchStoreRetainBytes int64 = 1 << 30
-	// searchStoreRetentionLockName is the directory-wide lock that serializes
-	// a publish with an eviction pass. It is held only for one rename and one
-	// pass, never for a build.
-	searchStoreRetentionLockName = "search-store-retention.lock"
 )
 
-// searchStoreRetentionLockWait bounds how long a publish waits for another
-// process's publish or eviction pass. Both take milliseconds, so the wait only
-// matters if a holder is wedged; past it the store is published without an
-// eviction pass. A var so a test can shorten it.
-var searchStoreRetentionLockWait = 5 * time.Second
+// searchStoreTempMaxAge is how old a temporary must be before a sweep removes
+// it as left by a crashed build. A build in progress keeps its temporary far
+// younger: the Linux kernel's store builds in about four minutes.
+const searchStoreTempMaxAge = 24 * time.Hour
 
 // Test seams. beforeSearchStorePublish runs after the store is built and
 // before it is renamed into place; an error it returns fails the publish, as
@@ -159,7 +162,7 @@ func searchStoreSidecarName(name string) bool {
 
 // newSearchStoreRetention builds the policy for publishing store, or reports
 // false when retention is off. It resolves the publishing checkout's HEAD tree
-// here, before the publish takes the lock, so the lock never waits on git.
+// here.
 func newSearchStoreRetention(ctx context.Context, store cacheEntry, cache *cachedSearchSnapshot) (searchStoreRetention, bool) {
 	keep := resolveSearchStoreKeep()
 	if keep <= 0 {
@@ -180,48 +183,83 @@ func newSearchStoreRetention(ctx context.Context, store cacheEntry, cache *cache
 	return retention, true
 }
 
-// acquireSearchStoreRetentionLock takes the directory-wide retention lock,
-// waiting at most searchStoreRetentionLockWait. It returns nil when the lock
-// cannot be opened or taken (read-only cache, unsupported platform, a wedged
-// holder, a cancelled context); the caller then publishes without evicting,
-// because an eviction is only safe while no publish can rename under it.
-func acquireSearchStoreRetentionLock(ctx context.Context, directory *os.Root) *completeBuildLock {
-	file, err := openCacheLockFileIn(directory, searchStoreRetentionLockName)
+// sweepSupersededSearchStores removes, from every key directory in directory,
+// each generation other than the key's current one (orderSearchStoreGenerations
+// against the key's gz entry) and the one this publish just wrote
+// (publishedName in publishedKeyDir), and each temporary older than
+// searchStoreTempMaxAge. It runs after every publish whatever the recency
+// window says, and takes no lock: a generation's content never changes, so a
+// removal can only ever delete what was listed. A key whose gz entry cannot be
+// stamped is skipped, since its current generation cannot be told apart. A
+// removal that fails (Windows: a reader holds the file) is skipped; the next
+// publish retries it.
+func sweepSupersededSearchStores(ctx context.Context, directory *os.Root, directoryPath, publishedKeyDir, publishedName string, remove func(*os.Root, string) error) {
+	names, err := listCacheDirectoryNames(directory)
 	if err != nil {
-		return nil
+		return
 	}
-	deadline := time.Now().Add(searchStoreRetentionLockWait)
-	poll := completeBuildLockPollMin
-	for {
-		err := tryLockBuildLockFile(file)
-		if err == nil {
-			return &completeBuildLock{file: file}
+	now := time.Now()
+	for _, name := range names {
+		if searchStoreKeyDirName(name) {
+			sweepSearchStoreKeyDir(ctx, directory, directoryPath, name, publishedKeyDir, publishedName, remove, now)
 		}
-		remaining := time.Until(deadline)
-		if !errors.Is(err, errBuildLockBusy) || remaining <= 0 || ctx.Err() != nil {
-			_ = file.Close()
-			return nil
+	}
+}
+
+func sweepSearchStoreKeyDir(ctx context.Context, directory *os.Root, directoryPath, name, publishedKeyDir, publishedName string, remove func(*os.Root, string) error, now time.Time) {
+	keyDirPath := filepath.Join(directoryPath, name)
+	entries, err := os.ReadDir(keyDirPath)
+	if err != nil {
+		return
+	}
+	generationCount := 0
+	var temporaries []string
+	for _, entry := range entries {
+		switch {
+		case searchStoreGenerationName(entry.Name()):
+			generationCount++
+		case searchStoreTempName(entry.Name()):
+			temporaries = append(temporaries, entry.Name())
 		}
-		timer := time.NewTimer(min(poll, remaining))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			_ = file.Close()
-			return nil
-		case <-timer.C:
+	}
+	if generationCount < 2 && len(temporaries) == 0 {
+		return
+	}
+	key := strings.TrimSuffix(name, searchStoreKeyDirSuffix)
+	entryStamp, err := currentSearchEntryStamp(cacheEntry{root: directoryPath, relative: key + ".json.gz"})
+	if err != nil {
+		return
+	}
+	keyDir, err := openCacheComponent(directory, name, (*os.Root).OpenRoot)
+	if err != nil {
+		return
+	}
+	defer keyDir.Close()
+	generations, err := listSearchStoreGenerations(ctx, keyDirPath)
+	if err != nil {
+		return
+	}
+	orderSearchStoreGenerations(generations, &entryStamp)
+	for index, generation := range generations {
+		if index == 0 || (name == publishedKeyDir && generation.name == publishedName) {
+			continue
 		}
-		poll = min(poll*2, completeBuildLockPollMax)
+		_ = remove(keyDir, generation.name)
+	}
+	for _, temporary := range temporaries {
+		if info, err := keyDir.Lstat(temporary); err == nil && now.Sub(info.ModTime()) > searchStoreTempMaxAge {
+			_ = remove(keyDir, temporary)
+		}
 	}
 }
 
 // evictSearchStoreSidecars removes the stores in the policy's group that fall
-// outside it. The caller must hold the retention lock. directoryPath is the
-// filesystem path of directory, which sqlite needs to read each store's
-// identity. A store whose identity cannot be read is never removed: retention
-// only deletes what it can attribute to the group being trimmed. Evicting a
-// key removes only the generations this pass listed; the key directory stays.
-// The result records generation names, legacy file names, and the name of a
-// key directory that could not be opened.
+// outside it. directoryPath is the filesystem path of directory, which sqlite
+// needs to read each store's identity. A store whose identity cannot be read
+// is never removed: retention only deletes what it can attribute to the group
+// being trimmed. Evicting a key removes only the generations this pass listed;
+// the key directory stays. The result records generation names, legacy file
+// names, and the name of a key directory that could not be opened.
 func evictSearchStoreSidecars(ctx context.Context, directory *os.Root, directoryPath string, retention searchStoreRetention) (searchStoreEviction, error) {
 	candidates, err := listSearchStoreGroup(ctx, directory, directoryPath, retention.group)
 	if err != nil {
@@ -376,7 +414,7 @@ func readSearchStoreRetentionIdentity(ctx context.Context, path string) (string,
 // what survives is always a prefix of the newest. Protected stores are kept
 // wherever they sort.
 //
-// The rule is what makes concurrent passes safe even without the lock: a pass
+// The rule is what makes concurrent passes safe without a lock: a pass
 // evicts a store only when at least keep stores newer than it exist, or when
 // newer stores already fill the byte budget, and a store with that many newer
 // ones is refused by every later pass too. No interleaving can therefore evict

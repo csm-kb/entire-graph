@@ -632,8 +632,10 @@ func openExactSearchStore(ctx context.Context, cacheDir, key, tree string) (exac
 // `graph context` and the prebuild hash the entry.
 //
 // The store is the key's current generation (resolveSearchStoreGeneration).
-// A generation removed by a sweep between resolution and open is a resolution
-// race, not a fault: it is resolved once more, and then reported as a miss.
+// A generation removed between resolution and open, by another publish's
+// superseded sweep (sweepSupersededSearchStores) or retention window, is a
+// resolution race, not a fault: it is resolved once more, and then reported as
+// a miss.
 // modernc's open failure does not wrap fs.ErrNotExist, so the race is
 // recognised by an Lstat after the failure.
 func openExactSearchStoreForEntry(ctx context.Context, entry cacheEntry, tree string, entryDigest func(cacheEntry) (cacheDigest, error), trustStamp bool) (exactSearchStore, *sql.DB, error) {
