@@ -74,10 +74,10 @@ auto-generated notes on
   A store that cannot be written never fails the command and is never silent:
   `index` (a cold build, or a cache hit rebuilding a missing store) and a cold
   `def`, `neighbors`, `impact`, `explain` or `query` succeed with a
-  `W_SEARCH_STORE_UNAVAILABLE` warning in their `warnings`, and lookups take the
-  full snapshot load. `explain` gains a `warnings` array for this, present only
-  when there is one, and its text form prints a `- warning` line after the
-  declarations.
+  `W_SEARCH_STORE_UNAVAILABLE` warning in their `warnings`, and lookups use the
+  previous store if it still matches, otherwise the full snapshot load. `explain`
+  gains a `warnings` array for this, present only when there is one, and its text
+  form prints a `- warning` line after the declarations.
 - `--head` `def`, `neighbors`, `impact` and `explain` answer from a focused
   subgraph read from the sqlite store instead of loading the full snapshot. On
   the Linux kernel a lookup drops from about 55 s and 16-46 GB of memory to
